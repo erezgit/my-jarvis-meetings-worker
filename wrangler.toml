@@ -1,0 +1,36 @@
+# Multi-tenant meetings Worker for Recall.ai integration.
+#
+# Per-tenant Durable Objects (MeetingTenantDO) keyed by tenant slug
+# (e.g. "erez", "yaron"). Each DO holds that tenant's
+# `database_url`, `recall_webhook_secret`, and `tenant_key`.
+# Adding a new tenant is a single POST to /admin/register.
+#
+# Deploy with:
+#   CLOUDFLARE_API_TOKEN=... npx wrangler deploy
+#
+# Route: https://my-jarvis-meetings-worker.<account>.workers.dev
+
+name = "my-jarvis-meetings-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-06"
+
+# Wrangler/esbuild's bundler walks up the directory tree looking for resolution
+# markers and finds ~/.pnp.cjs (a Yarn PnP manifest from another project that
+# happens to live in $HOME). Aliasing forces it to resolve via the local
+# node_modules. nodejs_compat is intentionally NOT enabled — neon serverless
+# uses fetch only and doesn't need Node APIs.
+[alias]
+"@neondatabase/serverless" = "./node_modules/@neondatabase/serverless"
+
+# Public host of this Worker. Used to build the Recall webhook URL when
+# starting a bot. Override per environment if a custom domain is attached.
+[vars]
+WORKER_PUBLIC_HOST = "my-jarvis-meetings-worker.myjarvis.workers.dev"
+
+[[durable_objects.bindings]]
+name = "MEETING_TENANT"
+class_name = "MeetingTenantDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MeetingTenantDO"]
