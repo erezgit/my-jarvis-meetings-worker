@@ -82,9 +82,32 @@ export async function handleRecallBot(
     body: JSON.stringify(recallBody),
   });
 
-  // Propagate Recall errors verbatim — the caller knows their domain.
   const text = await r.text();
   console.log(`[recall/bot] slug=${slug} status=${r.status}`);
+
+  // On success, normalise the Recall payload to a stable {bot_id, raw} shape
+  // so dashboards don't depend on Recall's exact field names.
+  // On error, propagate Recall's body verbatim — the caller knows their domain.
+  if (r.status >= 200 && r.status < 300) {
+    let recall: { id?: unknown };
+    try {
+      recall = JSON.parse(text);
+    } catch {
+      return json(
+        { ok: false, error: "recall returned non-JSON success", raw: text.slice(0, 500) },
+        502,
+      );
+    }
+    const botId = typeof recall.id === "string" ? recall.id : null;
+    if (!botId) {
+      return json(
+        { ok: false, error: "recall response missing id", raw: recall },
+        502,
+      );
+    }
+    return json({ bot_id: botId, raw: recall });
+  }
+
   return new Response(text, {
     status: r.status,
     headers: {
