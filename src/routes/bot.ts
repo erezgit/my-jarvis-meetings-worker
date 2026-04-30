@@ -54,13 +54,14 @@ export async function handleRecallBot(
     `https://${env.WORKER_PUBLIC_HOST}/recall/webhook` +
     `?tenant=${encodeURIComponent(slug)}&sig=${sig}`;
 
-  // Deepgram model + language. Default to nova-2 + Hebrew (matches the old
-  // my-jarvis-base default). Can be overridden per-call in the future via
-  // body.language. Note: Deepgram's "multi" mode doesn't include Hebrew yet,
-  // so genuine Hebrew↔English code-switching needs a different approach.
-  const language = typeof body?.language === "string" && body.language.length > 0
-    ? body.language
-    : "he";
+  // Deepgram model + language. Default to nova-3 + Hebrew — same combo the
+  // old my-jarvis-base used; verified to work for Hebrew transcription.
+  // (nova-2 + "he" did not produce transcript events in our last live test.)
+  // Caller can override via body.language; model is fixed for now.
+  const language =
+    typeof body?.language === "string" && body.language.length > 0
+      ? body.language
+      : "he";
 
   const recallBody = {
     meeting_url: body.meeting_url,
@@ -68,7 +69,7 @@ export async function handleRecallBot(
     recording_config: {
       transcript: {
         provider: {
-          deepgram_streaming: { model: "nova-2", language },
+          deepgram_streaming: { model: "nova-3", language },
         },
       },
       // Only subscribe to `transcript.data` (finalised segments). The
@@ -82,6 +83,20 @@ export async function handleRecallBot(
           events: ["transcript.data"],
         },
       ],
+    },
+    // Seed `automatic_audio_output` with a silent MP3 placeholder. Recall
+    // requires *some* audio config at bot-creation time for the
+    // /output_audio/ endpoint (used later to speak Jarvis's responses) to
+    // be enabled. The b64 below is the shortest valid silent MP3 — copied
+    // verbatim from the old my-jarvis-base.
+    automatic_audio_output: {
+      in_call_recording: {
+        data: {
+          kind: "mp3",
+          b64_data:
+            "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAAYYoRwBHAAAAAAD/+1DEAAAB8ANoAAAAIAAANIAAAAQAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7UMQfAAPAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV",
+        },
+      },
     },
   };
 
