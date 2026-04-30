@@ -38,6 +38,8 @@ export interface BotStartBody {
   meeting_url: string;
   title?: string;
   meeting_id?: string;
+  /** Deepgram language code, e.g. "he", "en", "multi". Defaults to "he". */
+  language?: string;
 }
 
 /** Body of `POST /recall/play`. */

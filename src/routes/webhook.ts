@@ -13,22 +13,22 @@ import {
  * Public — no bearer. Authenticated by HMAC-SHA256 over the slug using the
  * tenant's `recall_webhook_secret`.
  *
- * Recall's realtime payload (transcript.data / transcript.partial_data):
+ * Recall's actual realtime payload (verified live 2026-04-30):
  *   {
  *     event: "transcript.data" | "transcript.partial_data",
  *     data: {
- *       bot:        { id: string },
- *       transcript: {
- *         words:    Array<{ text, start_time, end_time, ... }>,
- *         speaker?: { name?, id?, is_host? }
+ *       bot: { id, metadata },
+ *       data: {                      <-- NOTE: nested `data.data`, not `data.transcript`
+ *         words: [{
+ *           text: string,
+ *           start_timestamp: { absolute: ISO, relative: number },
+ *           end_timestamp:   { absolute: ISO, relative: number }
+ *         }, ...],
+ *         participant: { id, name, is_host, platform, ... }
  *       },
- *       recording: { ... }
+ *       recording, transcript, realtime_endpoint: { id, metadata }
  *     }
  *   }
- *
- * We persist the words array verbatim — this Worker is a transport; the
- * dashboard owns rendering. Note: the *old* base joined words into a string
- * before insert; that's lossy and we're not doing it.
  */
 export async function handleRecallWebhook(
   request: Request,
@@ -69,13 +69,15 @@ export async function handleRecallWebhook(
     return json({ ok: true, skipped: "no bot_id" });
   }
 
-  const transcript = data.transcript ?? {};
-  const words = Array.isArray(transcript.words) ? transcript.words : [];
-  const speaker = transcript.speaker ?? {};
+  // Recall's transcript payload is at data.data (not data.transcript).
+  const inner = (data.data ?? {}) as RecallInnerData;
+  const words = Array.isArray(inner.words) ? inner.words : [];
+  const participant = inner.participant ?? {};
 
-  // Recall sends start/end on each word; surface the segment span.
-  const startTs = numericOrNull(words[0]?.start_time);
-  const endTs = numericOrNull(words[words.length - 1]?.end_time);
+  // Word timestamps are objects with .relative (seconds since recording start)
+  // and .absolute (ISO 8601). Persist .relative as the segment span.
+  const startTs = numericOrNull(words[0]?.start_timestamp?.relative);
+  const endTs = numericOrNull(words[words.length - 1]?.end_timestamp?.relative);
 
   // Join words into a single text line — matches the meeting_transcript.words
   // TEXT column. The full structured payload still lives in `raw` (jsonb).
@@ -87,12 +89,12 @@ export async function handleRecallWebhook(
 
   const seg: TranscriptSegment = {
     bot_id: botId,
-    speaker_name: typeof speaker.name === "string" ? speaker.name : null,
+    speaker_name: typeof participant.name === "string" ? participant.name : null,
     speaker_id:
-      typeof speaker.id === "string" || typeof speaker.id === "number"
-        ? String(speaker.id)
+      typeof participant.id === "string" || typeof participant.id === "number"
+        ? String(participant.id)
         : null,
-    is_host: typeof speaker.is_host === "boolean" ? speaker.is_host : null,
+    is_host: typeof participant.is_host === "boolean" ? participant.is_host : null,
     words: wordsText,
     start_ts: startTs,
     end_ts: endTs,
@@ -131,11 +133,22 @@ interface RecallWebhookPayload {
 
 interface RecallWebhookData {
   bot?: { id?: string };
-  transcript?: {
-    words?: Array<{ text?: string; start_time?: unknown; end_time?: unknown }>;
-    speaker?: { name?: string; id?: string | number; is_host?: boolean };
-  };
+  data?: RecallInnerData;
   recording?: unknown;
+}
+
+interface RecallInnerData {
+  words?: Array<{
+    text?: string;
+    start_timestamp?: { relative?: unknown; absolute?: unknown };
+    end_timestamp?: { relative?: unknown; absolute?: unknown };
+  }>;
+  participant?: {
+    id?: string | number;
+    name?: string;
+    is_host?: boolean;
+    platform?: string;
+  };
 }
 
 function numericOrNull(v: unknown): number | null {

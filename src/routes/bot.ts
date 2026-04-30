@@ -54,20 +54,32 @@ export async function handleRecallBot(
     `https://${env.WORKER_PUBLIC_HOST}/recall/webhook` +
     `?tenant=${encodeURIComponent(slug)}&sig=${sig}`;
 
+  // Deepgram model + language. Default to nova-2 + Hebrew (matches the old
+  // my-jarvis-base default). Can be overridden per-call in the future via
+  // body.language. Note: Deepgram's "multi" mode doesn't include Hebrew yet,
+  // so genuine Hebrew↔English code-switching needs a different approach.
+  const language = typeof body?.language === "string" && body.language.length > 0
+    ? body.language
+    : "he";
+
   const recallBody = {
     meeting_url: body.meeting_url,
     bot_name: "Jarvis",
     recording_config: {
       transcript: {
         provider: {
-          deepgram_streaming: { model: "nova-3", language: "en" },
+          deepgram_streaming: { model: "nova-2", language },
         },
       },
+      // Only subscribe to `transcript.data` (finalised segments). The
+      // `transcript.partial_data` event fires while a speaker is mid-utterance,
+      // which would write duplicates as the words stream in. The dashboard
+      // polls every 5 s — that's already "live enough" for v1.
       realtime_endpoints: [
         {
           type: "webhook",
           url: webhookUrl,
-          events: ["transcript.data", "transcript.partial_data"],
+          events: ["transcript.data"],
         },
       ],
     },
