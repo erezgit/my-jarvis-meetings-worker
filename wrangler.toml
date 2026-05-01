@@ -2,8 +2,15 @@
 #
 # Per-tenant Durable Objects (MeetingTenantDO) keyed by tenant slug
 # (e.g. "erez", "yaron"). Each DO holds that tenant's
-# `database_url`, `recall_webhook_secret`, and `tenant_key`.
+# `database_url`, `recall_webhook_secret`, `tenant_key`, and (after calendar
+# OAuth) Google refresh_token + channel state + sync_token.
 # Adding a new tenant is a single POST to /admin/register.
+#
+# Per-meeting Durable Objects (MeetingDO) keyed by `meeting:<slug>:<event_id>`
+# carry the alarm() that fires Recall bot creation 30s before each meeting.
+#
+# KV namespace `CALENDAR_ROUTING` is the reverse-lookup `channel_id → tenant`
+# (Google push payloads carry only the channel id).
 #
 # Deploy with:
 #   CLOUDFLARE_API_TOKEN=... npx wrangler deploy
@@ -23,7 +30,8 @@ compatibility_date = "2024-11-06"
 "@neondatabase/serverless" = "./node_modules/@neondatabase/serverless"
 
 # Public host of this Worker. Used to build the Recall webhook URL when
-# starting a bot. Override per environment if a custom domain is attached.
+# starting a bot, plus the Google watch channel address. Override per
+# environment if a custom domain is attached.
 [vars]
 WORKER_PUBLIC_HOST = "my-jarvis-meetings-worker.myjarvis.workers.dev"
 
@@ -31,6 +39,28 @@ WORKER_PUBLIC_HOST = "my-jarvis-meetings-worker.myjarvis.workers.dev"
 name = "MEETING_TENANT"
 class_name = "MeetingTenantDO"
 
+[[durable_objects.bindings]]
+name = "MEETING_DO"
+class_name = "MeetingDO"
+
+# Reverse-lookup: `channel:<X-Goog-Channel-Id>` → tenant_slug, plus
+# CSRF storage at `csrf:<token>` with TTL.
+# TODO: create the namespace and paste the real id here:
+#   npx wrangler kv namespace create CALENDAR_ROUTING
+[[kv_namespaces]]
+binding = "CALENDAR_ROUTING"
+id = "9f12cabfa0f94f95b5c5876f8764b8e0"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MeetingTenantDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MeetingDO"]
+
+# Reconcile cron — every 5 min.
+# - Channel renewal at T-24h before Google's 7-day expiry
+# - Missed-dispatch DLQ for the at-least-once alarm system
+[triggers]
+crons = ["*/5 * * * *"]

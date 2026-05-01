@@ -1,0 +1,395 @@
+import type {
+  DurableObjectNamespace,
+  DurableObjectState,
+  DurableObjectStub,
+} from "@cloudflare/workers-types";
+import { fetchTenantConfig, getTenantStub } from "./do";
+import { hmacSha256Hex } from "./lib/hmac";
+import { neon } from "@neondatabase/serverless";
+import { createRecallBot, recallBotLeave } from "./lib/recall-bot";
+import type {
+  Env,
+  MeetingState,
+  MeetingUpsertBody,
+  TenantConfig,
+} from "./lib/types";
+
+/**
+ * MeetingDO — one instance per (tenant_slug, google_event_id).
+ * idFromName: `meeting:<tenant_slug>:<google_event_id>`.
+ *
+ * Storage:
+ *   "state" → MeetingState
+ *
+ * Internal HTTP surface:
+ *   POST /_internal/upsert       body: MeetingUpsertBody    -> 200 {ok, state}
+ *   POST /_internal/cancel                                  -> 200 {ok}
+ *   GET  /_internal/state                                   -> 200 MeetingState | 404
+ *
+ * On `setAlarm`, when the alarm fires we:
+ *   1. No-op if status === 'dispatched' || dispatched_at_ms is set (idempotent)
+ *   2. No-op if status === 'cancelled'
+ *   3. Call Recall to spawn a bot
+ *   4. UPSERT into tenant Neon `calendar_events` + `meetings`
+ *   5. Persist new state with status='dispatched'
+ *
+ * IDEMPOTENCY: Cloudflare retries alarm() up to 6× on thrown errors. Recall
+ * gets an Idempotency-Key per (tenant, event) so duplicates are no-ops on
+ * their side too. The dispatched_at_ms check is the primary guard.
+ */
+export class MeetingDO {
+  private state: DurableObjectState;
+  private env: Env;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const method = request.method.toUpperCase();
+
+    if (url.pathname === "/_internal/upsert" && method === "POST") {
+      const body = (await request.json()) as MeetingUpsertBody;
+      if (
+        typeof body?.tenant_slug !== "string" ||
+        typeof body?.google_event_id !== "string" ||
+        typeof body?.start_time_ms !== "number" ||
+        typeof body?.end_time_ms !== "number" ||
+        typeof body?.title !== "string" ||
+        typeof body?.meeting_url !== "string"
+      ) {
+        return jsonResponse({ ok: false, error: "invalid body" }, 400);
+      }
+
+      const existing =
+        (await this.state.storage.get<MeetingState>("state")) ?? null;
+
+      // Preserve dispatch state across upserts — if we already fired the bot
+      // we don't want a calendar update to flip status back to 'scheduled'.
+      const next: MeetingState = {
+        tenant_slug: body.tenant_slug,
+        google_event_id: body.google_event_id,
+        start_time_ms: body.start_time_ms,
+        end_time_ms: body.end_time_ms,
+        title: body.title,
+        meeting_url: body.meeting_url,
+        status: existing?.status === "dispatched" ? "dispatched" : "scheduled",
+        recall_bot_id: existing?.recall_bot_id ?? null,
+        dispatched_at_ms: existing?.dispatched_at_ms ?? null,
+        meeting_id_neon: existing?.meeting_id_neon ?? null,
+      };
+      await this.state.storage.put("state", next);
+
+      // Schedule the alarm 30s before start_time. If start has already
+      // passed (or is within 1s) we clamp to "now+1s" so the alarm fires
+      // immediately. Past timestamps can silently never fire (CF issue
+      // #18324) — clamping is the documented workaround.
+      if (next.status === "scheduled") {
+        const target = next.start_time_ms - 30_000;
+        const safe = Math.max(target, Date.now() + 1000);
+        await this.state.storage.setAlarm(safe);
+      }
+
+      return jsonResponse({ ok: true, state: next });
+    }
+
+    if (url.pathname === "/_internal/cancel" && method === "POST") {
+      const existing =
+        (await this.state.storage.get<MeetingState>("state")) ?? null;
+      if (!existing) return jsonResponse({ ok: true, was: "absent" });
+
+      // Best-effort: if we already dispatched, ask Recall to leave.
+      if (existing.status === "dispatched" && existing.recall_bot_id) {
+        try {
+          await recallBotLeave({
+            apiKey: this.env.RECALL_API_KEY,
+            botId: existing.recall_bot_id,
+          });
+        } catch (err) {
+          console.error(
+            `[meeting-do] cancel: recall leave failed for ${existing.recall_bot_id}:`,
+            err,
+          );
+          // Don't throw — cancellation in our state is what matters.
+        }
+      }
+
+      const next: MeetingState = { ...existing, status: "cancelled" };
+      await this.state.storage.put("state", next);
+      await this.state.storage.deleteAlarm();
+      return jsonResponse({ ok: true });
+    }
+
+    if (url.pathname === "/_internal/state" && method === "GET") {
+      const s = await this.state.storage.get<MeetingState>("state");
+      if (!s) return jsonResponse({ ok: false, error: "no state" }, 404);
+      return jsonResponse(s);
+    }
+
+    return new Response("meeting-do — internal namespace only", { status: 410 });
+  }
+
+  /**
+   * Alarm handler — must be idempotent. CF Workers fires alarms at-least-once
+   * with up to 6 retries on thrown errors before silently dropping.
+   */
+  async alarm(): Promise<void> {
+    const s = (await this.state.storage.get<MeetingState>("state")) ?? null;
+    if (!s) {
+      console.warn("[meeting-do.alarm] no state — orphan alarm dropped");
+      return;
+    }
+    if (s.status === "dispatched" || s.dispatched_at_ms) {
+      console.log(
+        `[meeting-do.alarm] already dispatched event=${s.google_event_id} bot=${s.recall_bot_id}`,
+      );
+      return;
+    }
+    if (s.status === "cancelled" || s.status === "failed") {
+      console.log(
+        `[meeting-do.alarm] status=${s.status} for event=${s.google_event_id} — skip`,
+      );
+      return;
+    }
+    if (!s.meeting_url || s.meeting_url.length === 0) {
+      // No meeting URL means no Recall bot can join. Mark failed so we don't
+      // retry every minute via the reconcile cron.
+      const next: MeetingState = { ...s, status: "failed" };
+      await this.state.storage.put("state", next);
+      console.warn(
+        `[meeting-do.alarm] no meeting_url event=${s.google_event_id} — marked failed`,
+      );
+      return;
+    }
+
+    // Pull tenant config — we need recall_webhook_secret for the transcript
+    // webhook URL HMAC, plus database_url for the Neon insert.
+    const tenantStub = getTenantStub(this.env.MEETING_TENANT, s.tenant_slug);
+    const cfg = await fetchTenantConfig(tenantStub, s.tenant_slug);
+    if (!cfg) {
+      throw new Error(
+        `[meeting-do.alarm] tenant ${s.tenant_slug} has no config — cannot dispatch`,
+      );
+    }
+
+    const sig = await hmacSha256Hex(cfg.recall_webhook_secret, s.tenant_slug);
+    const webhookUrl =
+      `https://${this.env.WORKER_PUBLIC_HOST}/recall/webhook` +
+      `?tenant=${encodeURIComponent(s.tenant_slug)}&sig=${sig}`;
+
+    const dedupeKey = `meeting:${s.tenant_slug}:${s.google_event_id}`;
+
+    let result: { bot_id: string };
+    try {
+      result = await createRecallBot({
+        apiKey: this.env.RECALL_API_KEY,
+        meetingUrl: s.meeting_url,
+        webhookUrl,
+        language: "he",
+        metadata: {
+          tenant: s.tenant_slug,
+          event_id: s.google_event_id,
+        },
+        dedupeKey,
+      });
+    } catch (err) {
+      // Throw — CF will retry up to 6× (exponential backoff) before silent drop.
+      // The 5-min reconcile cron is our DLQ for that final silent drop.
+      console.error(
+        `[meeting-do.alarm] recall create failed event=${s.google_event_id}:`,
+        err,
+      );
+      throw err;
+    }
+
+    const dispatchedAt = Date.now();
+
+    // Persist into Neon — single source of truth for the dashboard. We write
+    // BOTH `calendar_events` (the upcoming-meetings list) and `meetings` (the
+    // existing transcript table — its `bot_id` is what /recall/webhook joins
+    // on).
+    let meetingIdNeon: number | null = null;
+    try {
+      meetingIdNeon = await persistDispatchedMeeting({
+        databaseUrl: cfg.database_url,
+        state: s,
+        botId: result.bot_id,
+        dispatchedAtMs: dispatchedAt,
+      });
+    } catch (err) {
+      // We DID dispatch — recording the dispatch in our state is more
+      // important than the Neon row. Log and continue; the reconcile cron
+      // can re-attempt the Neon write.
+      console.error(
+        `[meeting-do.alarm] neon persist failed event=${s.google_event_id} bot=${result.bot_id}:`,
+        err,
+      );
+    }
+
+    const next: MeetingState = {
+      ...s,
+      status: "dispatched",
+      recall_bot_id: result.bot_id,
+      dispatched_at_ms: dispatchedAt,
+      meeting_id_neon: meetingIdNeon,
+    };
+    await this.state.storage.put("state", next);
+    console.log(
+      `[meeting-do.alarm] dispatched event=${s.google_event_id} bot=${result.bot_id} tenant=${s.tenant_slug}`,
+    );
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Helpers (used by routes/calendar-* to talk to MeetingDO)
+ * ------------------------------------------------------------------------ */
+
+export function getMeetingStub(
+  ns: DurableObjectNamespace,
+  tenantSlug: string,
+  googleEventId: string,
+): DurableObjectStub {
+  const id = ns.idFromName(`meeting:${tenantSlug}:${googleEventId}`);
+  return ns.get(id);
+}
+
+export async function upsertMeetingDO(
+  ns: DurableObjectNamespace,
+  body: MeetingUpsertBody,
+): Promise<MeetingState> {
+  const stub = getMeetingStub(ns, body.tenant_slug, body.google_event_id);
+  const r = await stub.fetch(meetingInternalUrl("/_internal/upsert", body), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    throw new Error(`MeetingDO upsert failed: ${r.status}`);
+  }
+  const parsed = (await r.json()) as { ok: boolean; state: MeetingState };
+  return parsed.state;
+}
+
+export async function cancelMeetingDO(
+  ns: DurableObjectNamespace,
+  tenantSlug: string,
+  googleEventId: string,
+): Promise<void> {
+  const stub = getMeetingStub(ns, tenantSlug, googleEventId);
+  const r = await stub.fetch(
+    meetingInternalUrl("/_internal/cancel", { tenant_slug: tenantSlug, google_event_id: googleEventId }),
+    { method: "POST" },
+  );
+  if (!r.ok) {
+    throw new Error(`MeetingDO cancel failed: ${r.status}`);
+  }
+}
+
+export async function getMeetingDOState(
+  ns: DurableObjectNamespace,
+  tenantSlug: string,
+  googleEventId: string,
+): Promise<MeetingState | null> {
+  const stub = getMeetingStub(ns, tenantSlug, googleEventId);
+  const r = await stub.fetch(
+    meetingInternalUrl("/_internal/state", { tenant_slug: tenantSlug, google_event_id: googleEventId }),
+    { method: "GET" },
+  );
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`MeetingDO get-state failed: ${r.status}`);
+  return (await r.json()) as MeetingState;
+}
+
+/* --------------------------------------------------------------------------
+ * Internals
+ * ------------------------------------------------------------------------ */
+
+function meetingInternalUrl(
+  path: string,
+  ctx: { tenant_slug: string; google_event_id: string },
+): string {
+  const safeTenant = encodeURIComponent(ctx.tenant_slug);
+  const safeEvent = encodeURIComponent(ctx.google_event_id);
+  return `https://meeting-${safeTenant}-${safeEvent}.do${path}`;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * Persist the dispatched meeting into tenant Neon. Writes:
+ *   - `calendar_events` (UPSERT — created on initial sync, status flipped to dispatched here)
+ *   - `meetings` (INSERT — provides the bot_id row that /recall/webhook joins on)
+ *
+ * Returns calendar_events.id for back-reference in DO state.
+ *
+ * Schema assumed (per Neon migration `006_calendar_events.sql` in PRD):
+ *   calendar_events(id, tenant_id?, google_event_id UNIQUE, title, start_time TIMESTAMPTZ,
+ *                   end_time TIMESTAMPTZ, meeting_url, status, recall_bot_id,
+ *                   dispatched_at TIMESTAMPTZ, raw JSONB, created_at, updated_at)
+ *   meetings(id, bot_id UNIQUE, title, meeting_url, language, started_at)
+ */
+async function persistDispatchedMeeting(opts: {
+  databaseUrl: string;
+  state: MeetingState;
+  botId: string;
+  dispatchedAtMs: number;
+}): Promise<number | null> {
+  const sql = neon(opts.databaseUrl);
+  const startIso = new Date(opts.state.start_time_ms).toISOString();
+  const endIso = new Date(opts.state.end_time_ms).toISOString();
+  const dispatchedIso = new Date(opts.dispatchedAtMs).toISOString();
+
+  // 1) Upsert into calendar_events. ON CONFLICT on google_event_id flips
+  // status to 'dispatched' and stamps recall_bot_id + dispatched_at.
+  const ceRows = (await sql`
+    INSERT INTO calendar_events (
+      google_event_id, title, start_time, end_time, meeting_url,
+      status, recall_bot_id, dispatched_at, raw, created_at, updated_at
+    ) VALUES (
+      ${opts.state.google_event_id},
+      ${opts.state.title},
+      ${startIso},
+      ${endIso},
+      ${opts.state.meeting_url},
+      'dispatched',
+      ${opts.botId},
+      ${dispatchedIso},
+      ${JSON.stringify({})}::jsonb,
+      now(),
+      now()
+    )
+    ON CONFLICT (google_event_id) DO UPDATE SET
+      status = 'dispatched',
+      recall_bot_id = EXCLUDED.recall_bot_id,
+      dispatched_at = EXCLUDED.dispatched_at,
+      updated_at = now()
+    RETURNING id
+  `) as Array<{ id: number }>;
+
+  // 2) Insert into meetings (the table /recall/webhook joins on via bot_id).
+  // Idempotent via ON CONFLICT (bot_id) — Recall bot ids are unique already
+  // but the cron may retry persistDispatchedMeeting after a Neon failure.
+  await sql`
+    INSERT INTO meetings (bot_id, title, meeting_url, language, started_at)
+    VALUES (
+      ${opts.botId},
+      ${opts.state.title},
+      ${opts.state.meeting_url},
+      'he',
+      ${startIso}
+    )
+    ON CONFLICT (bot_id) DO NOTHING
+  `;
+
+  return ceRows[0]?.id ?? null;
+}
+
+// Re-export so type-only consumers don't need to reach into ./lib/types.
+export type { TenantConfig };
