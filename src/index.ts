@@ -12,6 +12,7 @@ import {
 } from "./routes/calendar-oauth";
 import { handleCalendarNotify } from "./routes/calendar-notify";
 import { handleCalendarDisconnect } from "./routes/calendar-disconnect";
+import { handleCalendarStatus } from "./routes/calendar-status";
 import { reconcileAllTenants } from "./cron-reconcile";
 
 // Re-export Durable Object classes so wrangler can bind them.
@@ -90,6 +91,10 @@ export default {
 
       if (path === "/calendar/disconnect" && method === "POST") {
         return await handleCalendarDisconnect(request, env);
+      }
+
+      if (path === "/calendar/status" && method === "GET") {
+        return await handleCalendarStatus(request, env);
       }
 
       return json({ ok: false, error: "not found" }, 404);
