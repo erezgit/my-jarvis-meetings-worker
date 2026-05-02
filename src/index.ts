@@ -7,6 +7,7 @@ import { handleRecallLeave } from "./routes/leave";
 import { handleRecallPlay } from "./routes/play";
 import { handleRecallWebhook } from "./routes/webhook";
 import { handleVexaTranscript } from "./routes/vexa-transcript";
+import { handleWhisperTranscribe } from "./routes/whisper-transcribe";
 import {
   handleOAuthCallback,
   handleOAuthStart,
@@ -81,6 +82,14 @@ export default {
       // so the relay's signature requirements stay distinct.
       if (path === "/vexa/transcript" && method === "POST") {
         return await handleVexaTranscript(request, env);
+      }
+
+      // Whisper-API-compatible proxy for Vexa Lite. Vexa points its
+      // TRANSCRIPTION_SERVICE_URL at this endpoint and we fan out to
+      // Cloudflare Workers AI's GPU-backed Whisper. Replaces embedded
+      // faster-whisper on the Fly Vexa box.
+      if (path === "/v1/audio/transcriptions" && method === "POST") {
+        return await handleWhisperTranscribe(request, env);
       }
 
       // Calendar routes — accept GET on /oauth/start so a plain link can kick

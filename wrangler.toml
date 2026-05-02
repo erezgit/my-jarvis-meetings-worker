@@ -56,6 +56,13 @@ class_name = "MeetingDO"
 binding = "CALENDAR_ROUTING"
 id = "9f12cabfa0f94f95b5c5876f8764b8e0"
 
+# Cloudflare Workers AI binding — used by /v1/audio/transcriptions to run
+# `@cf/openai/whisper-large-v3-turbo` on Cloudflare's edge GPU farm.
+# Vexa Lite calls this proxy instead of running its own faster-whisper on
+# our Fly machine, freeing the Fly box of GPU/CPU pressure.
+[ai]
+binding = "AI"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MeetingTenantDO"]

@@ -37,6 +37,18 @@ export interface Env {
 
   /** Vexa API key (admin or scoped). `wrangler secret put VEXA_API_KEY`. */
   VEXA_API_KEY: string;
+
+  /**
+   * Cloudflare Workers AI binding. Drives the Whisper proxy at
+   * /v1/audio/transcriptions. Declared in wrangler.toml as `[ai] binding = "AI"`.
+   */
+  AI: { run(model: string, input: unknown): Promise<unknown> };
+
+  /**
+   * Bearer token Vexa Lite sends as TRANSCRIPTION_SERVICE_TOKEN to authenticate
+   * to the Whisper proxy. `wrangler secret put WHISPER_PROXY_TOKEN`.
+   */
+  WHISPER_PROXY_TOKEN: string;
 }
 
 /**

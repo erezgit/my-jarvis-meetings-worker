@@ -134,7 +134,7 @@ export class MeetingDO {
       const now = Date.now();
       const next: MeetingState = {
         tenant_slug: body.tenant_slug,
-        google_event_id: `manual:${body.bot_id}`,
+        google_event_id: `manual-${body.bot_id}`,
         start_time_ms: now,
         end_time_ms: now + 4 * 60 * 60 * 1000,
         title: body.title ?? "manual",
@@ -577,9 +577,10 @@ export async function startVexaPollingForBot(
   },
 ): Promise<void> {
   // Synthesize a stable id so multiple calls for the same bot route to the
-  // same DO. Using bot_id (Vexa's internal id) is enough since it's unique
-  // per Vexa instance.
-  const eventId = `manual:${body.bot_id}`;
+  // same DO. Use `manual-<bot_id>` (hyphen, not colon) so the resulting
+  // hostname segment is encoder-safe — encodeURIComponent of "manual:8"
+  // produces "manual%3A8", invalid as a hostname label.
+  const eventId = `manual-${body.bot_id}`;
   const id = ns.idFromName(`meeting:${body.tenant_slug}:${eventId}`);
   const stub = ns.get(id);
   const safeTenant = encodeURIComponent(body.tenant_slug);
