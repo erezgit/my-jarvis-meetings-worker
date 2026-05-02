@@ -8,6 +8,7 @@ import { hmacSha256Hex } from "../lib/hmac";
 import type { BotStartBody, Env } from "../lib/types";
 import { fetchTenantConfig, getTenantStub } from "../do";
 import { createVexaBot, parseVexaMeetingUrl } from "../lib/vexa-bot";
+import { startVexaPollingForBot } from "../do-meeting";
 
 const RECALL_BOT_URL = "https://eu-central-1.recall.ai/api/v1/bot/";
 
@@ -98,6 +99,26 @@ export async function handleRecallBot(
       console.log(
         `[bot.vexa] slug=${slug} platform=${parsed.platform} native_id=${parsed.nativeMeetingId} bot=${out.bot_id}`,
       );
+      // Spin up a MeetingDO that polls Vexa for transcripts every 5s and
+      // mirrors them into Neon. Doing this here (instead of from the
+      // dashboard) keeps the Worker the single source of truth for the
+      // Recall→Vexa cutover. Failure to arm polling is logged but not
+      // fatal — the bot creation itself succeeded.
+      try {
+        await startVexaPollingForBot(env.MEETING_DO, {
+          tenant_slug: slug,
+          bot_id: out.bot_id,
+          meeting_url: body.meeting_url,
+          platform: parsed.platform,
+          native_meeting_id: parsed.nativeMeetingId,
+          title: typeof body.title === "string" ? body.title : undefined,
+        });
+      } catch (err) {
+        console.error(
+          `[bot.vexa] start-polling failed slug=${slug} bot=${out.bot_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
       // Same response shape as the Recall path: { bot_id, raw } so the
       // dashboard doesn't have to branch.
       return json({

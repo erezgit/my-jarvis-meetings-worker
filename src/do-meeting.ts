@@ -7,7 +7,13 @@ import { fetchTenantConfig, getTenantStub } from "./do";
 import { hmacSha256Hex } from "./lib/hmac";
 import { neon } from "@neondatabase/serverless";
 import { createRecallBot, recallBotLeave } from "./lib/recall-bot";
-import { createVexaBot, parseVexaMeetingUrl } from "./lib/vexa-bot";
+import {
+  createVexaBot,
+  getVexaTranscripts,
+  parseVexaMeetingUrl,
+} from "./lib/vexa-bot";
+import { adaptVexaSegment } from "./lib/vexa-transcript-adapter";
+import { insertTranscriptSegment } from "./lib/neon";
 import type {
   Env,
   MeetingState,
@@ -98,6 +104,56 @@ export class MeetingDO {
       return jsonResponse({ ok: true, state: next });
     }
 
+    if (url.pathname === "/_internal/start-vexa-polling" && method === "POST") {
+      // Used by /recall/bot for manually-started meetings (no calendar event).
+      // Seeds the DO with a synthetic state already in "dispatched" mode and
+      // arms the transcript-polling alarm 30s out. Idempotent — re-calling is
+      // a no-op if state already shows the same bot.
+      const body = (await request.json()) as {
+        tenant_slug: string;
+        bot_id: string;
+        meeting_url: string;
+        platform: "google_meet" | "zoom" | "teams";
+        native_meeting_id: string;
+        meeting_id_neon?: number | null;
+        title?: string;
+      };
+      if (
+        typeof body?.tenant_slug !== "string" ||
+        typeof body?.bot_id !== "string" ||
+        typeof body?.platform !== "string" ||
+        typeof body?.native_meeting_id !== "string"
+      ) {
+        return jsonResponse({ ok: false, error: "invalid body" }, 400);
+      }
+      const existing =
+        (await this.state.storage.get<MeetingState>("state")) ?? null;
+      if (existing?.recall_bot_id === body.bot_id) {
+        return jsonResponse({ ok: true, already: true });
+      }
+      const now = Date.now();
+      const next: MeetingState = {
+        tenant_slug: body.tenant_slug,
+        google_event_id: `manual:${body.bot_id}`,
+        start_time_ms: now,
+        end_time_ms: now + 4 * 60 * 60 * 1000,
+        title: body.title ?? "manual",
+        meeting_url: body.meeting_url,
+        status: "dispatched",
+        recall_bot_id: body.bot_id,
+        dispatched_at_ms: now,
+        meeting_id_neon: body.meeting_id_neon ?? null,
+        bot_provider: "vexa",
+        vexa_platform: body.platform,
+        vexa_native_meeting_id: body.native_meeting_id,
+        poll_started_ms: now,
+      };
+      await this.state.storage.put("state", next);
+      // First poll 30s out — gives the bot time to actually join.
+      await this.state.storage.setAlarm(now + 30_000);
+      return jsonResponse({ ok: true, state: next });
+    }
+
     if (url.pathname === "/_internal/cancel" && method === "POST") {
       const existing =
         (await this.state.storage.get<MeetingState>("state")) ?? null;
@@ -137,6 +193,12 @@ export class MeetingDO {
   /**
    * Alarm handler — must be idempotent. CF Workers fires alarms at-least-once
    * with up to 6 retries on thrown errors before silently dropping.
+   *
+   * Two responsibilities, branched by state.status:
+   *   1. status="scheduled" → dispatch the bot to Recall or Vexa
+   *   2. status="dispatched" + bot_provider="vexa" → poll Vexa transcripts
+   *      every 5s, insert new segments into Neon, then re-arm the alarm.
+   *      Stops when Vexa reports terminal status or polling exceeds budget.
    */
   async alarm(): Promise<void> {
     const s = (await this.state.storage.get<MeetingState>("state")) ?? null;
@@ -144,15 +206,26 @@ export class MeetingDO {
       console.warn("[meeting-do.alarm] no state — orphan alarm dropped");
       return;
     }
-    if (s.status === "dispatched" || s.dispatched_at_ms) {
+    if (
+      s.status === "cancelled" ||
+      s.status === "failed" ||
+      s.status === "completed"
+    ) {
       console.log(
-        `[meeting-do.alarm] already dispatched event=${s.google_event_id} bot=${s.recall_bot_id}`,
+        `[meeting-do.alarm] status=${s.status} for event=${s.google_event_id} — terminal, no further alarms`,
       );
       return;
     }
-    if (s.status === "cancelled" || s.status === "failed") {
+
+    // Already dispatched and on Vexa → enter the transcript-polling loop.
+    if (s.status === "dispatched" && s.bot_provider === "vexa") {
+      await this.pollVexaTranscriptsTick(s);
+      return;
+    }
+    // Already dispatched on Recall → webhooks handle it; nothing to do here.
+    if (s.status === "dispatched" || s.dispatched_at_ms) {
       console.log(
-        `[meeting-do.alarm] status=${s.status} for event=${s.google_event_id} — skip`,
+        `[meeting-do.alarm] already dispatched event=${s.google_event_id} bot=${s.recall_bot_id} provider=${s.bot_provider ?? "recall"}`,
       );
       return;
     }
@@ -286,11 +359,158 @@ export class MeetingDO {
       bot_provider: provider,
       vexa_platform: vexaPlatform,
       vexa_native_meeting_id: vexaNativeId,
+      poll_started_ms: provider === "vexa" ? dispatchedAt : undefined,
     };
     await this.state.storage.put("state", next);
     console.log(
       `[meeting-do.alarm] dispatched event=${s.google_event_id} bot=${result.bot_id} tenant=${s.tenant_slug} provider=${provider}`,
     );
+
+    // Vexa: arm the transcript-polling loop. First poll fires 30s after
+    // dispatch — gives the bot time to join and produce its first segment.
+    if (provider === "vexa") {
+      await this.state.storage.setAlarm(Date.now() + 30_000);
+    }
+  }
+
+  /**
+   * One tick of the Vexa transcript-polling loop. Called from alarm() when
+   * status === "dispatched" && bot_provider === "vexa".
+   *
+   * Each tick:
+   *   1. GET Vexa /transcripts/<platform>/<native_id>
+   *   2. Filter segments where absolute_end_time > state.last_synced_iso
+   *   3. Insert each new segment into Neon meeting_transcript
+   *   4. Advance last_synced_iso to the new max
+   *   5. If Vexa reports terminal status → mark our state terminal, no re-alarm
+   *      Else → re-alarm in 5s
+   *
+   * Errors don't throw past this method — they log + still re-alarm so a
+   * transient Vexa hiccup doesn't permanently stop polling.
+   */
+  private async pollVexaTranscriptsTick(s: MeetingState): Promise<void> {
+    const RE_ALARM_MS = 5_000;
+    const HARD_BUDGET_MS = 4 * 60 * 60 * 1000; // 4 hours
+    const POLL_BUDGET_EXCEEDED =
+      s.poll_started_ms !== undefined &&
+      Date.now() - s.poll_started_ms > HARD_BUDGET_MS;
+
+    if (POLL_BUDGET_EXCEEDED) {
+      console.warn(
+        `[meeting-do.poll] budget exceeded event=${s.google_event_id} — stopping`,
+      );
+      const next: MeetingState = { ...s, status: "completed" };
+      await this.state.storage.put("state", next);
+      return;
+    }
+
+    if (
+      !this.env.VEXA_API_URL ||
+      !this.env.VEXA_API_KEY ||
+      !s.vexa_platform ||
+      !s.vexa_native_meeting_id ||
+      !s.recall_bot_id
+    ) {
+      console.error(
+        `[meeting-do.poll] missing config event=${s.google_event_id} — re-alarming`,
+      );
+      await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
+      return;
+    }
+
+    const tenantStub = getTenantStub(this.env.MEETING_TENANT, s.tenant_slug);
+    const cfg = await fetchTenantConfig(tenantStub, s.tenant_slug);
+    if (!cfg) {
+      console.error(
+        `[meeting-do.poll] no tenant cfg slug=${s.tenant_slug} — re-alarming`,
+      );
+      await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
+      return;
+    }
+
+    let result;
+    try {
+      result = await getVexaTranscripts({
+        apiUrl: this.env.VEXA_API_URL,
+        apiKey: this.env.VEXA_API_KEY,
+        platform: s.vexa_platform,
+        nativeMeetingId: s.vexa_native_meeting_id,
+      });
+    } catch (err) {
+      console.error(
+        `[meeting-do.poll] fetch failed event=${s.google_event_id}:`,
+        err instanceof Error ? err.message : err,
+      );
+      // Transient — try again next tick.
+      await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
+      return;
+    }
+
+    // Diff by absolute_end_time watermark. Vexa's segments come sorted
+    // by start time but `absolute_end_time` is the safer monotonic guarantee
+    // because earlier segments can be re-emitted as "completed" later.
+    const watermark = s.last_synced_iso ?? "";
+    const newSegments = result.segments.filter((seg) => {
+      const end =
+        typeof seg.absolute_end_time === "string"
+          ? seg.absolute_end_time
+          : "";
+      return end > watermark && typeof seg.text === "string" && seg.text.length > 0;
+    });
+
+    let inserted = 0;
+    let newWatermark = watermark;
+    for (const seg of newSegments) {
+      const adapted = adaptVexaSegment(seg, {
+        botId: s.recall_bot_id,
+        meetingStartIso: result.start_time ?? null,
+        eventType: "transcript.mutable",
+      });
+      try {
+        const ok = await insertTranscriptSegment(cfg.database_url, adapted);
+        if (ok) inserted++;
+      } catch (err) {
+        console.error(
+          `[meeting-do.poll] insert failed event=${s.google_event_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      const end =
+        typeof seg.absolute_end_time === "string"
+          ? seg.absolute_end_time
+          : "";
+      if (end > newWatermark) newWatermark = end;
+    }
+
+    if (inserted > 0) {
+      console.log(
+        `[meeting-do.poll] event=${s.google_event_id} inserted=${inserted} watermark=${newWatermark}`,
+      );
+    }
+
+    // Persist new watermark + maybe transition to terminal.
+    const isTerminal =
+      result.status === "completed" || result.status === "failed";
+    const nextStatus: MeetingState["status"] = isTerminal
+      ? result.status === "failed"
+        ? "failed"
+        : "completed"
+      : s.status;
+
+    const next: MeetingState = {
+      ...s,
+      last_synced_iso: newWatermark || undefined,
+      status: nextStatus,
+    };
+    await this.state.storage.put("state", next);
+
+    if (!isTerminal) {
+      await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
+    } else {
+      console.log(
+        `[meeting-do.poll] event=${s.google_event_id} Vexa status=${result.status} — polling stopped`,
+      );
+    }
   }
 }
 
@@ -336,6 +556,44 @@ export async function cancelMeetingDO(
   );
   if (!r.ok) {
     throw new Error(`MeetingDO cancel failed: ${r.status}`);
+  }
+}
+
+/**
+ * Seed a MeetingDO for a manually-started Vexa meeting (no calendar event)
+ * and arm the transcript-polling alarm. Called from /recall/bot when the
+ * tenant's bot_provider is "vexa".
+ */
+export async function startVexaPollingForBot(
+  ns: DurableObjectNamespace,
+  body: {
+    tenant_slug: string;
+    bot_id: string;
+    meeting_url: string;
+    platform: "google_meet" | "zoom" | "teams";
+    native_meeting_id: string;
+    meeting_id_neon?: number | null;
+    title?: string;
+  },
+): Promise<void> {
+  // Synthesize a stable id so multiple calls for the same bot route to the
+  // same DO. Using bot_id (Vexa's internal id) is enough since it's unique
+  // per Vexa instance.
+  const eventId = `manual:${body.bot_id}`;
+  const id = ns.idFromName(`meeting:${body.tenant_slug}:${eventId}`);
+  const stub = ns.get(id);
+  const safeTenant = encodeURIComponent(body.tenant_slug);
+  const safeEvent = encodeURIComponent(eventId);
+  const r = await stub.fetch(
+    `https://meeting-${safeTenant}-${safeEvent}.do/_internal/start-vexa-polling`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!r.ok) {
+    throw new Error(`startVexaPollingForBot failed: ${r.status}`);
   }
 }
 

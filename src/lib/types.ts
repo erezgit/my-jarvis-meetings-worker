@@ -215,7 +215,7 @@ export interface MeetingState {
   end_time_ms: number;
   title: string;
   meeting_url: string;
-  status: "scheduled" | "dispatched" | "cancelled" | "failed";
+  status: "scheduled" | "dispatched" | "cancelled" | "failed" | "completed";
   /**
    * Active bot id from the dispatched provider. Field name kept for backward
    * compat with existing Neon rows; semantically provider-agnostic.
@@ -232,6 +232,20 @@ export interface MeetingState {
   vexa_native_meeting_id?: string;
   /** Which provider was actually dispatched (so reads can branch correctly). */
   bot_provider?: "recall" | "vexa";
+
+  // ---- Vexa transcript-polling state (only used when bot_provider=="vexa") ----
+  /**
+   * ISO 8601 of the last segment we synced from Vexa to Neon. Each alarm tick
+   * fetches the full transcript list, filters by `absolute_end_time > this`,
+   * inserts new segments, then advances this watermark to the new max.
+   */
+  last_synced_iso?: string;
+  /**
+   * Wall-clock ms when we first saw the meeting in Vexa. Used to bound the
+   * polling loop — if we've been polling for >2× max meeting length and Vexa
+   * still hasn't terminated, stop alarming so a wedged DO doesn't spin forever.
+   */
+  poll_started_ms?: number;
 }
 
 /**

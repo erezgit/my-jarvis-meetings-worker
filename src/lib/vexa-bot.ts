@@ -86,11 +86,18 @@ export async function createVexaBot(
   } catch {
     throw new Error(`Vexa bot create returned non-JSON: ${text.slice(0, 200)}`);
   }
-  if (typeof parsed.id !== "string") {
+  // Vexa returns a numeric `id`; Recall returned a string. Coerce here so
+  // downstream consumers can keep treating bot_id as a single string column.
+  let botId: string;
+  if (typeof parsed.id === "string") {
+    botId = parsed.id;
+  } else if (typeof parsed.id === "number") {
+    botId = String(parsed.id);
+  } else {
     throw new Error(`Vexa bot create response missing id: ${text.slice(0, 200)}`);
   }
   return {
-    bot_id: parsed.id,
+    bot_id: botId,
     platform: opts.platform,
     native_meeting_id: opts.nativeMeetingId,
     raw: parsed,
@@ -170,6 +177,87 @@ export async function vexaSpeak(opts: {
 
 function trimTrailingSlash(s: string): string {
   return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+/**
+ * Fetch the latest transcript snapshot for a Vexa meeting. The endpoint
+ * returns the full segment list each call — caller filters by timestamp
+ * watermark to avoid double-inserting.
+ *
+ * Vexa returns segment objects shaped like:
+ *   { text, speaker, language, segment_id, absolute_start_time, absolute_end_time, completed }
+ * plus a meeting envelope with `status` (active | completed | failed | ...).
+ */
+export interface VexaTranscriptsResult {
+  /** Vexa meeting id (numeric). */
+  id: number;
+  /** Lifecycle status — drives whether the polling loop should keep running. */
+  status:
+    | "requested"
+    | "joining"
+    | "awaiting_admission"
+    | "active"
+    | "stopping"
+    | "completed"
+    | "failed";
+  segments: Array<{
+    text?: string;
+    speaker?: string | null;
+    segment_id?: string;
+    absolute_start_time?: string;
+    absolute_end_time?: string;
+    [k: string]: unknown;
+  }>;
+  /** Used to anchor relative timestamps (Vexa returns ISO 8601 absolutes). */
+  start_time?: string | null;
+  /** Full raw payload — kept for debugging / future use. */
+  raw: unknown;
+}
+
+export async function getVexaTranscripts(opts: {
+  apiUrl: string;
+  apiKey: string;
+  platform: VexaBotCreateOpts["platform"];
+  nativeMeetingId: string;
+}): Promise<VexaTranscriptsResult> {
+  const url = `${trimTrailingSlash(opts.apiUrl)}/transcripts/${encodeURIComponent(
+    opts.platform,
+  )}/${encodeURIComponent(opts.nativeMeetingId)}`;
+  const r = await fetch(url, {
+    headers: { "X-API-Key": opts.apiKey },
+  });
+  const text = await r.text();
+  if (!r.ok) {
+    throw new Error(
+      `Vexa transcripts fetch failed ${r.status}: ${text.slice(0, 400)}`,
+    );
+  }
+  let parsed: {
+    id?: unknown;
+    status?: unknown;
+    segments?: unknown;
+    start_time?: unknown;
+  };
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `Vexa transcripts returned non-JSON: ${text.slice(0, 200)}`,
+    );
+  }
+  const segs = Array.isArray(parsed.segments)
+    ? (parsed.segments as VexaTranscriptsResult["segments"])
+    : [];
+  return {
+    id: typeof parsed.id === "number" ? parsed.id : -1,
+    status: (typeof parsed.status === "string"
+      ? parsed.status
+      : "active") as VexaTranscriptsResult["status"],
+    segments: segs,
+    start_time:
+      typeof parsed.start_time === "string" ? parsed.start_time : null,
+    raw: parsed,
+  };
 }
 
 /**
