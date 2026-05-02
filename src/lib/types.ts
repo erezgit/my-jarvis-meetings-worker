@@ -187,9 +187,20 @@ export interface VexaTranscriptBody {
   meeting_start_iso?: string;
 }
 
-/** Body of `POST /recall/leave`. */
+/**
+ * Body of `POST /recall/leave`.
+ *
+ * For Vexa tenants the platform + native_meeting_id are also required —
+ * Vexa's stop endpoint is keyed by `(platform, native_meeting_id)`, not
+ * by bot_id. Dashboard already has both on the meetings row; pass them
+ * through. The Recall path ignores them.
+ */
 export interface LeaveBody {
   bot_id: string;
+  platform?: "google_meet" | "zoom" | "teams";
+  native_meeting_id?: string;
+  /** Optional fallback: Worker can parse platform + native_meeting_id from this. */
+  meeting_url?: string;
 }
 
 /**
