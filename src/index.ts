@@ -6,6 +6,7 @@ import { handleRecallBot } from "./routes/bot";
 import { handleRecallLeave } from "./routes/leave";
 import { handleRecallPlay } from "./routes/play";
 import { handleRecallWebhook } from "./routes/webhook";
+import { handleVexaTranscript } from "./routes/vexa-transcript";
 import {
   handleOAuthCallback,
   handleOAuthStart,
@@ -73,6 +74,13 @@ export default {
 
       if (path === "/recall/leave" && method === "POST") {
         return await handleRecallLeave(request, env);
+      }
+
+      // Vexa relay → Worker transcript ingest. Auth via tenant_key bearer
+      // (same as /recall/play). Deliberately separate path from /recall/webhook
+      // so the relay's signature requirements stay distinct.
+      if (path === "/vexa/transcript" && method === "POST") {
+        return await handleVexaTranscript(request, env);
       }
 
       // Calendar routes — accept GET on /oauth/start so a plain link can kick

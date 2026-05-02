@@ -7,6 +7,7 @@ import { fetchTenantConfig, getTenantStub } from "./do";
 import { hmacSha256Hex } from "./lib/hmac";
 import { neon } from "@neondatabase/serverless";
 import { createRecallBot, recallBotLeave } from "./lib/recall-bot";
+import { createVexaBot, parseVexaMeetingUrl } from "./lib/vexa-bot";
 import type {
   Env,
   MeetingState,
@@ -82,12 +83,14 @@ export class MeetingDO {
       };
       await this.state.storage.put("state", next);
 
-      // Schedule the alarm 30s before start_time. If start has already
-      // passed (or is within 1s) we clamp to "now+1s" so the alarm fires
-      // immediately. Past timestamps can silently never fire (CF issue
-      // #18324) — clamping is the documented workaround.
+      // Schedule the alarm 90s before start_time. The 90-second buffer
+      // accommodates Fly Machines `suspend` wake-up + Vexa container start
+      // when bot_provider="vexa". For bot_provider="recall" this is a no-op
+      // — Recall just gets the bot in the lobby a minute earlier. Past
+      // timestamps can silently never fire (CF issue #18324) — clamp to
+      // now+1s as the documented workaround.
       if (next.status === "scheduled") {
-        const target = next.start_time_ms - 30_000;
+        const target = next.start_time_ms - 90_000;
         const safe = Math.max(target, Date.now() + 1000);
         await this.state.storage.setAlarm(safe);
       }
@@ -181,27 +184,73 @@ export class MeetingDO {
 
     const dedupeKey = `meeting:${s.tenant_slug}:${s.google_event_id}`;
 
+    // Per-tenant provider switch. Defaults to recall for backward compat —
+    // explicitly flipping to "vexa" is how we cut a tenant over.
+    const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
+
     let result: { bot_id: string };
-    try {
-      result = await createRecallBot({
-        apiKey: this.env.RECALL_API_KEY,
-        meetingUrl: s.meeting_url,
-        webhookUrl,
-        language: "he",
-        metadata: {
-          tenant: s.tenant_slug,
-          event_id: s.google_event_id,
-        },
-        dedupeKey,
-      });
-    } catch (err) {
-      // Throw — CF will retry up to 6× (exponential backoff) before silent drop.
-      // The 5-min reconcile cron is our DLQ for that final silent drop.
-      console.error(
-        `[meeting-do.alarm] recall create failed event=${s.google_event_id}:`,
-        err,
-      );
-      throw err;
+    let vexaPlatform: "google_meet" | "zoom" | "teams" | undefined;
+    let vexaNativeId: string | undefined;
+
+    if (provider === "vexa") {
+      // Vexa pre-flight: must have a configured Vexa instance. If the tenant
+      // is flipped without secrets in place, fail loudly rather than silently
+      // falling back to Recall.
+      if (!this.env.VEXA_API_URL || this.env.VEXA_API_URL.length === 0) {
+        throw new Error(
+          `[meeting-do.alarm] tenant ${s.tenant_slug} bot_provider=vexa but VEXA_API_URL not set`,
+        );
+      }
+      if (!this.env.VEXA_API_KEY || this.env.VEXA_API_KEY.length === 0) {
+        throw new Error(
+          `[meeting-do.alarm] tenant ${s.tenant_slug} bot_provider=vexa but VEXA_API_KEY not set`,
+        );
+      }
+
+      const parsed = parseVexaMeetingUrl(s.meeting_url);
+      vexaPlatform = parsed.platform;
+      vexaNativeId = parsed.nativeMeetingId;
+
+      try {
+        const out = await createVexaBot({
+          apiUrl: this.env.VEXA_API_URL,
+          apiKey: this.env.VEXA_API_KEY,
+          platform: parsed.platform,
+          nativeMeetingId: parsed.nativeMeetingId,
+          language: "he",
+          task: "transcribe",
+          botName: "Jarvis",
+        });
+        result = { bot_id: out.bot_id };
+      } catch (err) {
+        console.error(
+          `[meeting-do.alarm] vexa create failed event=${s.google_event_id}:`,
+          err,
+        );
+        throw err;
+      }
+    } else {
+      try {
+        result = await createRecallBot({
+          apiKey: this.env.RECALL_API_KEY,
+          meetingUrl: s.meeting_url,
+          webhookUrl,
+          language: "he",
+          metadata: {
+            tenant: s.tenant_slug,
+            event_id: s.google_event_id,
+          },
+          dedupeKey,
+        });
+      } catch (err) {
+        // Throw — CF will retry up to 6× (exponential backoff) before silent drop.
+        // The 5-min reconcile cron is our DLQ for that final silent drop.
+        console.error(
+          `[meeting-do.alarm] recall create failed event=${s.google_event_id}:`,
+          err,
+        );
+        throw err;
+      }
     }
 
     const dispatchedAt = Date.now();
@@ -234,10 +283,13 @@ export class MeetingDO {
       recall_bot_id: result.bot_id,
       dispatched_at_ms: dispatchedAt,
       meeting_id_neon: meetingIdNeon,
+      bot_provider: provider,
+      vexa_platform: vexaPlatform,
+      vexa_native_meeting_id: vexaNativeId,
     };
     await this.state.storage.put("state", next);
     console.log(
-      `[meeting-do.alarm] dispatched event=${s.google_event_id} bot=${result.bot_id} tenant=${s.tenant_slug}`,
+      `[meeting-do.alarm] dispatched event=${s.google_event_id} bot=${result.bot_id} tenant=${s.tenant_slug} provider=${provider}`,
     );
   }
 }

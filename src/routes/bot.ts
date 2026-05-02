@@ -7,6 +7,7 @@ import {
 import { hmacSha256Hex } from "../lib/hmac";
 import type { BotStartBody, Env } from "../lib/types";
 import { fetchTenantConfig, getTenantStub } from "../do";
+import { createVexaBot, parseVexaMeetingUrl } from "../lib/vexa-bot";
 
 const RECALL_BOT_URL = "https://eu-central-1.recall.ai/api/v1/bot/";
 
@@ -48,6 +49,76 @@ export async function handleRecallBot(
     return json({ ok: false, error: "meeting_url required" }, 400);
   }
 
+  // Provider switch — flip at the tenant level via /admin/register
+  // (bot_provider: "recall" | "vexa"). Defaults to "recall" for any
+  // tenant that hasn't been migrated. Without this branch, a manual
+  // "start meeting" click in the dashboard would still hit Recall even
+  // for vexa-cutover tenants.
+  const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
+
+  if (provider === "vexa") {
+    if (!env.VEXA_API_URL || env.VEXA_API_URL.length === 0) {
+      return json(
+        { ok: false, error: "VEXA_API_URL not configured on this worker" },
+        500,
+      );
+    }
+    if (!env.VEXA_API_KEY || env.VEXA_API_KEY.length === 0) {
+      return json(
+        { ok: false, error: "VEXA_API_KEY not configured on this worker" },
+        500,
+      );
+    }
+
+    let parsed;
+    try {
+      parsed = parseVexaMeetingUrl(body.meeting_url);
+    } catch (err) {
+      return json(
+        { ok: false, error: err instanceof Error ? err.message : "unsupported meeting URL" },
+        400,
+      );
+    }
+
+    const vexaLanguage =
+      typeof body?.language === "string" && body.language.length > 0
+        ? body.language
+        : "he";
+
+    try {
+      const out = await createVexaBot({
+        apiUrl: env.VEXA_API_URL,
+        apiKey: env.VEXA_API_KEY,
+        platform: parsed.platform,
+        nativeMeetingId: parsed.nativeMeetingId,
+        language: vexaLanguage,
+        task: "transcribe",
+        botName: "Jarvis",
+      });
+      console.log(
+        `[bot.vexa] slug=${slug} platform=${parsed.platform} native_id=${parsed.nativeMeetingId} bot=${out.bot_id}`,
+      );
+      // Same response shape as the Recall path: { bot_id, raw } so the
+      // dashboard doesn't have to branch.
+      return json({
+        bot_id: out.bot_id,
+        platform: parsed.platform,
+        native_meeting_id: parsed.nativeMeetingId,
+        raw: out.raw,
+      });
+    } catch (err) {
+      console.error(
+        `[bot.vexa] slug=${slug} create failed:`,
+        err instanceof Error ? err.message : err,
+      );
+      return json(
+        { ok: false, error: err instanceof Error ? err.message : "vexa create failed" },
+        502,
+      );
+    }
+  }
+
+  // ---- Recall path (unchanged from pre-pivot — kept for parallel-run) ----
   // Sign the slug, attach as querystring on the webhook URL we hand Recall.
   const sig = await hmacSha256Hex(cfg.recall_webhook_secret, slug);
   const webhookUrl =

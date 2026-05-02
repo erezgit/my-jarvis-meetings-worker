@@ -35,6 +35,11 @@ compatibility_date = "2024-11-06"
 [vars]
 WORKER_PUBLIC_HOST = "my-jarvis-meetings-worker.myjarvis.workers.dev"
 
+# Vexa instance base URL (no trailing slash).
+# Pointed at the Fly Machine running Vexa Lite + faster-whisper + relay.
+#   VEXA_API_KEY is a secret: `wrangler secret put VEXA_API_KEY`
+VEXA_API_URL = "https://my-jarvis-vexa-erez.fly.dev"
+
 [[durable_objects.bindings]]
 name = "MEETING_TENANT"
 class_name = "MeetingTenantDO"

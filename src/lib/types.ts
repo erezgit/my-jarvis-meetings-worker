@@ -28,6 +28,15 @@ export interface Env {
 
   /** Google OAuth client secret. `wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET`. */
   GOOGLE_OAUTH_CLIENT_SECRET: string;
+
+  /**
+   * Vexa instance base URL — e.g. `https://vexa.myjarvis.dev`.
+   * Set in wrangler.toml `[vars]`. Empty string disables Vexa routing.
+   */
+  VEXA_API_URL: string;
+
+  /** Vexa API key (admin or scoped). `wrangler secret put VEXA_API_KEY`. */
+  VEXA_API_KEY: string;
 }
 
 /**
@@ -44,6 +53,22 @@ export interface TenantConfig {
   recall_webhook_secret: string;
   /** Bearer token clients pass in `Authorization` to act as this tenant. */
   tenant_key: string;
+
+  // ---- Bot provider switch (Recall → Vexa cutover) ---------------------
+  /**
+   * Which meeting-bot provider to dispatch for new meetings.
+   * Defaults to `"recall"` when unset. Flipping to `"vexa"` is the per-tenant
+   * cutover. In-flight Recall meetings continue on the Recall path because
+   * MeetingDO.alarm() reads this when the alarm fires, not at upsert time.
+   */
+  bot_provider?: "recall" | "vexa";
+
+  /**
+   * Default Vexa platform inferred from the meeting URL when this tenant runs
+   * mostly on one platform (e.g. always Google Meet). Optional; if absent,
+   * the platform is parsed from each meeting URL at dispatch time.
+   */
+  vexa_default_platform?: "google_meet" | "zoom" | "teams";
 
   // ---- Google Calendar fields (set via /calendar/oauth/callback) ---------
   /** Long-lived Google OAuth refresh token. Exchanged for short-lived access tokens. */
@@ -82,6 +107,13 @@ export interface AdminRegisterBody {
   database_url: string;
   recall_webhook_secret: string;
   tenant_key: string;
+  /**
+   * Bot provider — defaults to `"recall"` when omitted (preserves existing
+   * tenants on the original code path). Set to `"vexa"` to cut a tenant over
+   * to the Fly-hosted Vexa Lite. Persisted via the same `setTenantConfig`
+   * call so the next meeting alarm picks it up.
+   */
+  bot_provider?: "recall" | "vexa";
 }
 
 /** Body of `POST /recall/bot`. */
@@ -93,11 +125,54 @@ export interface BotStartBody {
   language?: string;
 }
 
-/** Body of `POST /recall/play`. */
+/**
+ * Body of `POST /recall/play` (and the new `POST /play` provider-agnostic
+ * variant). For Vexa, the `platform` and `native_meeting_id` fields are
+ * required because Vexa's speak endpoint addresses the meeting by those, not
+ * by `bot_id`. The dashboard already knows them — they're on the `meetings`
+ * row.
+ */
 export interface PlayBody {
   bot_id: string;
   b64_audio: string;
   kind?: string;
+  /** Required when tenant `bot_provider` is `"vexa"`. Ignored for Recall. */
+  platform?: "google_meet" | "zoom" | "teams";
+  /** Required when tenant `bot_provider` is `"vexa"`. Ignored for Recall. */
+  native_meeting_id?: string;
+}
+
+/**
+ * Body of `POST /vexa/transcript` — the Vexa→Worker relay. The relay
+ * subscribes to Vexa's WebSocket and POSTs each transcript segment here.
+ * Auth: bearer (tenant_key) + X-Tenant header, same as /recall/play.
+ *
+ * Identification: provide EITHER `bot_id` (if the relay tracks our internal
+ * id) OR `(platform, native_meeting_id)` (the relay receives these directly
+ * from Vexa frames). When both are absent the request is rejected. When
+ * `bot_id` is present it is used directly; otherwise the Worker resolves
+ * `meetings.bot_id` by `meeting_url LIKE '%native_meeting_id%'`.
+ */
+export interface VexaTranscriptBody {
+  /** `meetings.bot_id` for the active session — supply if you have it. */
+  bot_id?: string;
+  /** Used to resolve bot_id when the relay only knows Vexa's identifiers. */
+  platform?: "google_meet" | "zoom" | "teams";
+  /** Used with `platform` for resolution. */
+  native_meeting_id?: string;
+  /** Vexa transcript segment as received from `wss://vexa-host/ws`. */
+  segment: {
+    text?: string;
+    speaker?: string | null;
+    absolute_start_time?: string;
+    absolute_end_time?: string;
+    updated_at?: string;
+  };
+  /**
+   * ISO 8601 meeting start anchor for converting absolute timestamps into
+   * relative seconds. Optional — null is acceptable per the schema.
+   */
+  meeting_start_iso?: string;
 }
 
 /** Body of `POST /recall/leave`. */
@@ -141,10 +216,22 @@ export interface MeetingState {
   title: string;
   meeting_url: string;
   status: "scheduled" | "dispatched" | "cancelled" | "failed";
+  /**
+   * Active bot id from the dispatched provider. Field name kept for backward
+   * compat with existing Neon rows; semantically provider-agnostic.
+   */
   recall_bot_id: string | null;
   dispatched_at_ms: number | null;
   /** FK into Neon `calendar_events.id` (or `meetings.id`) once dispatched. */
   meeting_id_neon: number | null;
+
+  // ---- Vexa-only addressing (set when bot_provider=="vexa" was used) ----
+  /** Vexa platform — needed by /play and /leave to address the meeting. */
+  vexa_platform?: "google_meet" | "zoom" | "teams";
+  /** Vexa native meeting id parsed from the meeting URL. */
+  vexa_native_meeting_id?: string;
+  /** Which provider was actually dispatched (so reads can branch correctly). */
+  bot_provider?: "recall" | "vexa";
 }
 
 /**

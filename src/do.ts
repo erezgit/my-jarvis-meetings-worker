@@ -55,12 +55,16 @@ export class MeetingTenantDO {
       }
       // Preserve any existing Google fields — set-config only replaces the
       // Recall-side fields. Calendar (re)connect uses /set-google-state.
+      // bot_provider is updatable here (used for the Recall→Vexa cutover).
       const existing = await this.loadConfig();
       const cfg: TenantConfig = {
         ...(existing ?? {}),
         database_url: body.database_url,
         recall_webhook_secret: body.recall_webhook_secret,
         tenant_key: body.tenant_key,
+        ...(body.bot_provider !== undefined
+          ? { bot_provider: body.bot_provider }
+          : {}),
       };
       await this.state.storage.put("config", cfg);
       this.cachedConfig = cfg;
