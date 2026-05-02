@@ -389,7 +389,7 @@ export class MeetingDO {
    * transient Vexa hiccup doesn't permanently stop polling.
    */
   private async pollVexaTranscriptsTick(s: MeetingState): Promise<void> {
-    const RE_ALARM_MS = 5_000;
+    const RE_ALARM_MS = 1_000;
     const HARD_BUDGET_MS = 4 * 60 * 60 * 1000; // 4 hours
     const POLL_BUDGET_EXCEEDED =
       s.poll_started_ms !== undefined &&
