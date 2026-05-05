@@ -7,7 +7,7 @@ import { getTenantStub, setTenantConfig } from "../do";
  *
  * Auth: `Authorization: Bearer <ADMIN_TOKEN>`
  *
- * Body: { slug, database_url, recall_webhook_secret, tenant_key }
+ * Body: { slug, database_url, tenant_key, vexa_api_url?, vexa_api_key? }
  *
  * Idempotent: writes config into the tenant's MeetingTenantDO, replacing
  * whatever was there. Adding a brand-new tenant or rotating any of its
@@ -33,26 +33,12 @@ export async function handleAdminRegister(
     typeof body?.slug !== "string" ||
     body.slug.trim().length === 0 ||
     typeof body?.database_url !== "string" ||
-    typeof body?.recall_webhook_secret !== "string" ||
     typeof body?.tenant_key !== "string"
   ) {
     return json(
       { ok: false, error: "missing required fields" },
       400,
     );
-  }
-
-  // Optional bot_provider — accepted for the Recall→Vexa cutover. Validated
-  // here so a typo in a curl call doesn't get persisted as garbage.
-  let botProvider: "recall" | "vexa" | undefined;
-  if (body.bot_provider !== undefined) {
-    if (body.bot_provider !== "recall" && body.bot_provider !== "vexa") {
-      return json(
-        { ok: false, error: "bot_provider must be 'recall' or 'vexa'" },
-        400,
-      );
-    }
-    botProvider = body.bot_provider;
   }
 
   // Optional per-tenant Vexa instance — when set, this tenant's bots dispatch
@@ -76,15 +62,13 @@ export async function handleAdminRegister(
   const stub = getTenantStub(env.MEETING_TENANT, slug);
   await setTenantConfig(stub, slug, {
     database_url: body.database_url,
-    recall_webhook_secret: body.recall_webhook_secret,
     tenant_key: body.tenant_key,
-    bot_provider: botProvider,
     vexa_api_url: vexaApiUrl,
     vexa_api_key: vexaApiKey,
   });
 
   console.log(
-    `[admin/register] slug=${slug}${botProvider ? ` bot_provider=${botProvider}` : ""}${vexaApiUrl ? ` vexa_api_url=${vexaApiUrl}` : ""}`,
+    `[admin/register] slug=${slug}${vexaApiUrl ? ` vexa_api_url=${vexaApiUrl}` : ""}`,
   );
   return json({ ok: true });
 }

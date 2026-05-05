@@ -9,16 +9,17 @@ import { fetchTenantConfig, getTenantStub } from "../do";
 import { vexaBotLeave, parseVexaMeetingUrl } from "../lib/vexa-bot";
 
 /**
- * POST /recall/leave
+ * POST /meeting/leave
  *
  * Auth: `Authorization: Bearer <tenant_key>` + `X-Tenant: <slug>`.
  *
- * Body: { bot_id }
+ * Body: { bot_id, platform?, native_meeting_id?, meeting_url? }
  *
- * Forwards to `POST /api/v1/bot/<bot_id>/leave_call/`. Recall's response is
- * propagated verbatim.
+ * Vexa's stop endpoint is keyed by `(platform, native_meeting_id)` — not by
+ * bot_id. Either supply them directly (the dashboard has them on the
+ * meetings row) or supply `meeting_url` and the Worker parses them out.
  */
-export async function handleRecallLeave(
+export async function handleMeetingLeave(
   request: Request,
   env: Env,
 ): Promise<Response> {
@@ -45,78 +46,53 @@ export async function handleRecallLeave(
     return json({ ok: false, error: "bot_id required" }, 400);
   }
 
-  const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
-
-  if (provider === "vexa") {
-    const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
-    const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
-    if (!vexaUrl || !vexaKey) {
-      return json({ ok: false, error: "vexa not configured (cfg or env)" }, 500);
-    }
-    // Resolve (platform, native_meeting_id). Prefer body, fall back to URL parse.
-    let platform = body.platform;
-    let nativeId = body.native_meeting_id;
-    if ((!platform || !nativeId) && typeof body.meeting_url === "string") {
-      try {
-        const parsed = parseVexaMeetingUrl(body.meeting_url);
-        platform = platform ?? parsed.platform;
-        nativeId = nativeId ?? parsed.nativeMeetingId;
-      } catch {
-        /* fall through to error */
-      }
-    }
-    if (!platform || !nativeId) {
-      return json(
-        {
-          ok: false,
-          error:
-            "vexa leave needs platform + native_meeting_id (or meeting_url)",
-        },
-        400,
-      );
-    }
-    try {
-      await vexaBotLeave({
-        apiUrl: vexaUrl,
-        apiKey: vexaKey,
-        platform,
-        nativeMeetingId: nativeId,
-      });
-    } catch (err) {
-      console.error(
-        `[leave.vexa] slug=${slug} bot=${body.bot_id}:`,
-        err instanceof Error ? err.message : err,
-      );
-      return json(
-        { ok: false, error: err instanceof Error ? err.message : "vexa leave failed" },
-        502,
-      );
-    }
-    console.log(
-      `[leave.vexa] slug=${slug} bot=${body.bot_id} platform=${platform} native=${nativeId} stopped`,
-    );
-    return json({ ok: true });
+  const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
+  const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
+  if (!vexaUrl || !vexaKey) {
+    return json({ ok: false, error: "vexa not configured (cfg or env)" }, 500);
   }
 
-  // Recall path — unchanged.
-  const url = `https://eu-central-1.recall.ai/api/v1/bot/${encodeURIComponent(body.bot_id)}/leave_call/`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Token ${env.RECALL_API_KEY}`,
-    },
-  });
+  // Resolve (platform, native_meeting_id). Prefer body, fall back to URL parse.
+  let platform = body.platform;
+  let nativeId = body.native_meeting_id;
+  if ((!platform || !nativeId) && typeof body.meeting_url === "string") {
+    try {
+      const parsed = parseVexaMeetingUrl(body.meeting_url);
+      platform = platform ?? parsed.platform;
+      nativeId = nativeId ?? parsed.nativeMeetingId;
+    } catch {
+      /* fall through to error */
+    }
+  }
+  if (!platform || !nativeId) {
+    return json(
+      {
+        ok: false,
+        error: "leave needs platform + native_meeting_id (or meeting_url)",
+      },
+      400,
+    );
+  }
 
-  const text = await r.text();
+  try {
+    await vexaBotLeave({
+      apiUrl: vexaUrl,
+      apiKey: vexaKey,
+      platform,
+      nativeMeetingId: nativeId,
+    });
+  } catch (err) {
+    console.error(
+      `[meeting/leave] slug=${slug} bot=${body.bot_id}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return json(
+      { ok: false, error: err instanceof Error ? err.message : "vexa leave failed" },
+      502,
+    );
+  }
   console.log(
-    `[recall/leave] slug=${slug} bot=${body.bot_id} status=${r.status}`,
+    `[meeting/leave] slug=${slug} bot=${body.bot_id} platform=${platform} native=${nativeId} stopped`,
   );
-  return new Response(text, {
-    status: r.status,
-    headers: {
-      "Content-Type":
-        r.headers.get("Content-Type") ?? "application/json",
-    },
-  });
+  return json({ ok: true });
 }

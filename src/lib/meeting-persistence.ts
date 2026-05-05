@@ -130,7 +130,7 @@ export async function upsertCalendarMeeting(opts: {
 /**
  * Mark a meeting as dispatched — bot creation API call has succeeded; the bot
  * is starting up but is NOT yet in the meeting. Called from MeetingDO.alarm()
- * after createVexaBot/createRecallBot returns.
+ * after createVexaBot returns.
  *
  * Status semantics:
  *   - meetings.status stays at 'scheduled' (unchanged) — the user hasn't seen
@@ -162,7 +162,7 @@ export async function markMeetingDispatched(opts: {
   await sql`
     UPDATE calendar_events
     SET status = 'dispatched',
-        recall_bot_id = ${opts.botId},
+        bot_id = ${opts.botId},
         dispatched_at = ${dispatchedIso},
         updated_at = now()
     WHERE google_event_id = ${opts.googleEventId}
@@ -173,9 +173,7 @@ export async function markMeetingDispatched(opts: {
  * Flip meetings.status from 'scheduled' to 'live' when the bot has actually
  * joined the meeting and started recording.
  *
- * For Vexa: triggered by pollVexaTranscriptsTick when result.status === 'active'.
- * For Recall: would be triggered from the webhook handler (not yet wired —
- * Vexa is the active path).
+ * Triggered by pollVexaTranscriptsTick when result.status === 'active'.
  *
  * Idempotent — the WHERE clause restricts to status='scheduled', so repeated
  * calls (one per poll tick) are no-ops after the first transition.

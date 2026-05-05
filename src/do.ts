@@ -16,7 +16,7 @@ import type {
  * `env.MEETING_TENANT.idFromName(slug)`.
  *
  * Storage:
- *   "config" → TenantConfig (Recall fields + optional Google fields)
+ *   "config" → TenantConfig (tenant + Vexa fields + optional Google fields)
  *
  * Internal HTTP surface (called via `stub.fetch("https://do/<path>", ...)`):
  *   POST /_internal/set-config           body: TenantConfig            -> 200 {ok:true}
@@ -48,23 +48,17 @@ export class MeetingTenantDO {
       const body = (await request.json()) as TenantConfig;
       if (
         typeof body?.database_url !== "string" ||
-        typeof body?.recall_webhook_secret !== "string" ||
         typeof body?.tenant_key !== "string"
       ) {
         return jsonResponse({ ok: false, error: "invalid config" }, 400);
       }
       // Preserve any existing Google fields — set-config only replaces the
-      // Recall-side fields. Calendar (re)connect uses /set-google-state.
-      // bot_provider is updatable here (used for the Recall→Vexa cutover).
+      // tenant + Vexa fields. Calendar (re)connect uses /set-google-state.
       const existing = await this.loadConfig();
       const cfg: TenantConfig = {
         ...(existing ?? {}),
         database_url: body.database_url,
-        recall_webhook_secret: body.recall_webhook_secret,
         tenant_key: body.tenant_key,
-        ...(body.bot_provider !== undefined
-          ? { bot_provider: body.bot_provider }
-          : {}),
         ...(body.vexa_api_url !== undefined
           ? { vexa_api_url: body.vexa_api_url }
           : {}),
@@ -137,8 +131,13 @@ export class MeetingTenantDO {
       }
       const cleared: TenantConfig = {
         database_url: existing.database_url,
-        recall_webhook_secret: existing.recall_webhook_secret,
         tenant_key: existing.tenant_key,
+        ...(existing.vexa_api_url !== undefined
+          ? { vexa_api_url: existing.vexa_api_url }
+          : {}),
+        ...(existing.vexa_api_key !== undefined
+          ? { vexa_api_key: existing.vexa_api_key }
+          : {}),
       };
       await this.state.storage.put("config", cleared);
       this.cachedConfig = cleared;
@@ -188,8 +187,8 @@ export async function fetchTenantConfig(
   return (await r.json()) as TenantConfig;
 }
 
-/** Persist or replace the tenant's config (Recall-side fields only — Google
- * fields are preserved). */
+/** Persist or replace the tenant's config (tenant + Vexa fields — Google
+ * fields are preserved across this call). */
 export async function setTenantConfig(
   stub: DurableObjectStub,
   slug: string,

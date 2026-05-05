@@ -2,10 +2,9 @@ import type { ExecutionContext, ScheduledEvent } from "@cloudflare/workers-types
 import { json } from "./lib/auth";
 import type { Env } from "./lib/types";
 import { handleAdminRegister } from "./routes/admin";
-import { handleRecallBot } from "./routes/bot";
-import { handleRecallLeave } from "./routes/leave";
-import { handleRecallPlay } from "./routes/play";
-import { handleRecallWebhook } from "./routes/webhook";
+import { handleMeetingBot } from "./routes/bot";
+import { handleMeetingLeave } from "./routes/leave";
+import { handleMeetingPlay } from "./routes/play";
 import { handleVexaTranscript } from "./routes/vexa-transcript";
 import { handleWhisperTranscribe } from "./routes/whisper-transcribe";
 import {
@@ -24,12 +23,13 @@ export { MeetingDO } from "./do-meeting";
 /**
  * Default Worker fetch handler — single dispatcher over URL path + method.
  *
- * Existing routes:
+ * Meeting routes:
  *   POST /admin/register             → admin
- *   POST /recall/bot                 → bot
- *   POST /recall/webhook             → webhook (HMAC-authed)
- *   POST /recall/play                → play
- *   POST /recall/leave               → leave
+ *   POST /meeting/bot                → start a bot for a meeting URL
+ *   POST /meeting/play               → play TTS audio through the bot
+ *   POST /meeting/leave              → kick the bot
+ *   POST /vexa/transcript            → ingest a Vexa relay transcript segment
+ *   POST /v1/audio/transcriptions    → Workers-AI Whisper proxy for Vexa
  *   GET  /healthz                    → uptime probe
  *
  * Calendar routes:
@@ -37,6 +37,12 @@ export { MeetingDO } from "./do-meeting";
  *   GET  /calendar/oauth/callback    → exchange code, register watch, full sync
  *   POST /calendar/notify            → Google push receiver (channel token authed)
  *   POST /calendar/disconnect        → tear down channel + clear DO state
+ *   GET  /calendar/status            → connected? oauth_email? channel expires?
+ *
+ * Legacy redirects (will be removed once dashboards/scripts are updated):
+ *   POST /recall/bot   → 308 → /meeting/bot
+ *   POST /recall/play  → 308 → /meeting/play
+ *   POST /recall/leave → 308 → /meeting/leave
  *
  * Scheduled handler runs every 5 min:
  *   - Channel renewal at T-24h
@@ -61,25 +67,40 @@ export default {
         return await handleAdminRegister(request, env);
       }
 
+      // Meeting bot routes — Vexa-only as of commit a1d9140.
+      if (path === "/meeting/bot" && method === "POST") {
+        return await handleMeetingBot(request, env);
+      }
+      if (path === "/meeting/play" && method === "POST") {
+        return await handleMeetingPlay(request, env);
+      }
+      if (path === "/meeting/leave" && method === "POST") {
+        return await handleMeetingLeave(request, env);
+      }
+
+      // Legacy /recall/* paths — 308 Permanent Redirect (preserves method + body).
+      // Active until all callers (dashboards, scripts) migrate. Remove after
+      // a deprecation window.
       if (path === "/recall/bot" && method === "POST") {
-        return await handleRecallBot(request, env);
+        return Response.redirect(
+          new URL("/meeting/bot", url).toString(),
+          308,
+        );
       }
-
-      if (path === "/recall/webhook" && method === "POST") {
-        return await handleRecallWebhook(request, env);
-      }
-
       if (path === "/recall/play" && method === "POST") {
-        return await handleRecallPlay(request, env);
+        return Response.redirect(
+          new URL("/meeting/play", url).toString(),
+          308,
+        );
       }
-
       if (path === "/recall/leave" && method === "POST") {
-        return await handleRecallLeave(request, env);
+        return Response.redirect(
+          new URL("/meeting/leave", url).toString(),
+          308,
+        );
       }
 
-      // Vexa relay → Worker transcript ingest. Auth via tenant_key bearer
-      // (same as /recall/play). Deliberately separate path from /recall/webhook
-      // so the relay's signature requirements stay distinct.
+      // Vexa relay → Worker transcript ingest.
       if (path === "/vexa/transcript" && method === "POST") {
         return await handleVexaTranscript(request, env);
       }

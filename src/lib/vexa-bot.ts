@@ -1,16 +1,13 @@
 /**
- * Vexa.ai bot dispatch helper. Mirrors the shape of `recall-bot.ts` so
- * `do-meeting.ts` can swap providers behind a tenant-level `bot_provider`
- * switch without changing call sites.
+ * Vexa.ai bot dispatch helper.
  *
- * Vexa is the Apache-2.0 alternative to Recall.ai. Self-hosted on a Linux
- * box (Hetzner $5 VPS in Erez's deployment plan) running Vexa Lite. Uses
- * its own faster-whisper(large-v3-turbo) for STT, replacing the Recall →
- * DeepGram pipeline in one move. Same Whisper family the user already
- * validated for Hebrew via OpenSuperWhisper locally.
+ * Vexa is the Apache-2.0 self-hosted meeting-bot stack. We run Vexa Lite
+ * per-tenant on Fly Machines (one app per tenant: my-jarvis-vexa-erez,
+ * my-jarvis-vexa-yaron). Its bot uses faster-whisper(large-v3-turbo) for
+ * Hebrew STT but our deployment offloads transcription to Cloudflare
+ * Workers AI via the /v1/audio/transcriptions proxy.
  *
- * API spec source: https://docs.vexa.ai/api/bots and /api/interactive-bots
- * Verified against the official docs site on 2026-05-01.
+ * API spec source: https://docs.vexa.ai/api/bots and /api/interactive-bots.
  */
 
 export interface VexaBotCreateOpts {

@@ -9,23 +9,18 @@ import { fetchTenantConfig, getTenantStub } from "../do";
 import { vexaSpeak } from "../lib/vexa-bot";
 
 /**
- * POST /recall/play
+ * POST /meeting/play
  *
  * Auth: `Authorization: Bearer <tenant_key>` + `X-Tenant: <slug>`.
  *
- * Body: { bot_id, b64_audio, kind?, platform?, native_meeting_id? }
+ * Body: { bot_id, b64_audio, kind?, platform, native_meeting_id }
  *
- * Provider routing:
- *   - tenant.bot_provider === "recall" (default): forwards to
- *     `POST /api/v1/bot/<bot_id>/output_audio/` with RECALL_API_KEY.
- *   - tenant.bot_provider === "vexa": forwards to
- *     `POST /bots/<platform>/<native_meeting_id>/speak` on the Vexa instance
- *     with X-API-Key. `platform` and `native_meeting_id` MUST be supplied
- *     in the request body — the dashboard knows them from the meetings row.
- *
- * Provider response is propagated verbatim.
+ * Forwards to `POST /bots/<platform>/<native_meeting_id>/speak` on the
+ * tenant's Vexa instance with X-API-Key. `bot_id` is logged but not used in
+ * addressing — Vexa keys speak by (platform, native_meeting_id). Vexa's
+ * response is propagated verbatim.
  */
-export async function handleRecallPlay(
+export async function handleMeetingPlay(
   request: Request,
   env: Env,
 ): Promise<Response> {
@@ -54,85 +49,42 @@ export async function handleRecallPlay(
   if (typeof body?.b64_audio !== "string" || body.b64_audio.length === 0) {
     return json({ ok: false, error: "b64_audio required" }, 400);
   }
-
-  const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
-
-  if (provider === "vexa") {
-    const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
-    const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
-    if (!vexaUrl || vexaUrl.length === 0) {
-      return json(
-        { ok: false, error: "vexa_api_url not configured (cfg or env)" },
-        500,
-      );
-    }
-    if (!vexaKey || vexaKey.length === 0) {
-      return json(
-        { ok: false, error: "vexa_api_key not configured (cfg or env)" },
-        500,
-      );
-    }
-    if (
-      typeof body.platform !== "string" ||
-      typeof body.native_meeting_id !== "string"
-    ) {
-      return json(
-        {
-          ok: false,
-          error:
-            "platform and native_meeting_id required when tenant bot_provider=vexa",
-        },
-        400,
-      );
-    }
-
-    // Vexa speak default is PCM 24 kHz mono WAV. The kind field on the
-    // legacy Recall body is reused as the format hint when present;
-    // otherwise default to "wav" which matches Vexa docs.
-    const format =
-      body.kind === "mp3" || body.kind === "pcm" || body.kind === "opus"
-        ? body.kind
-        : "wav";
-
-    const r = await vexaSpeak({
-      apiUrl: vexaUrl,
-      apiKey: vexaKey,
-      platform: body.platform as "google_meet" | "zoom" | "teams",
-      nativeMeetingId: body.native_meeting_id,
-      audioBase64: body.b64_audio,
-      format,
-    });
-
-    console.log(
-      `[play.vexa] slug=${slug} bot=${body.bot_id} platform=${body.platform} status=${r.status}`,
+  if (
+    typeof body.platform !== "string" ||
+    typeof body.native_meeting_id !== "string"
+  ) {
+    return json(
+      { ok: false, error: "platform and native_meeting_id required" },
+      400,
     );
-    return new Response(r.body, {
-      status: r.status,
-      headers: { "Content-Type": r.contentType },
-    });
   }
 
-  // Recall path — unchanged from pre-pivot. Kept verbatim for parallel-run.
-  const kind = typeof body.kind === "string" && body.kind.length > 0 ? body.kind : "mp3";
-  const url = `https://eu-central-1.recall.ai/api/v1/bot/${encodeURIComponent(body.bot_id)}/output_audio/`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Token ${env.RECALL_API_KEY}`,
-    },
-    body: JSON.stringify({ kind, b64_data: body.b64_audio }),
+  const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
+  const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
+  if (!vexaUrl || vexaUrl.length === 0) {
+    return json({ ok: false, error: "vexa_api_url not configured (cfg or env)" }, 500);
+  }
+  if (!vexaKey || vexaKey.length === 0) {
+    return json({ ok: false, error: "vexa_api_key not configured (cfg or env)" }, 500);
+  }
+
+  // Vexa speak default is PCM 24 kHz mono WAV.
+  const format = body.kind ?? "wav";
+
+  const r = await vexaSpeak({
+    apiUrl: vexaUrl,
+    apiKey: vexaKey,
+    platform: body.platform,
+    nativeMeetingId: body.native_meeting_id,
+    audioBase64: body.b64_audio,
+    format,
   });
 
-  const text = await r.text();
   console.log(
-    `[recall/play] slug=${slug} bot=${body.bot_id} kind=${kind} status=${r.status}`,
+    `[meeting/play] slug=${slug} bot=${body.bot_id} platform=${body.platform} status=${r.status}`,
   );
-  return new Response(text, {
+  return new Response(r.body, {
     status: r.status,
-    headers: {
-      "Content-Type":
-        r.headers.get("Content-Type") ?? "application/json",
-    },
+    headers: { "Content-Type": r.contentType },
   });
 }

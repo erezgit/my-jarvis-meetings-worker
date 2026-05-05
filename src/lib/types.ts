@@ -14,11 +14,8 @@ export interface Env {
   /** Reverse-lookup KV: `channel_id → tenant_slug`. */
   CALENDAR_ROUTING: KVNamespace;
 
-  /** Public host of this Worker (no scheme). Used to build webhook URLs. */
+  /** Public host of this Worker (no scheme). Used to build callback URLs. */
   WORKER_PUBLIC_HOST: string;
-
-  /** Recall.ai API key. `wrangler secret put RECALL_API_KEY`. */
-  RECALL_API_KEY: string;
 
   /** Bearer token for `/admin/register`. `wrangler secret put ADMIN_TOKEN`. */
   ADMIN_TOKEN: string;
@@ -54,33 +51,15 @@ export interface Env {
 /**
  * Per-tenant config persisted inside `MeetingTenantDO` storage.
  *
- * Recall fields are required for the existing /recall/* routes. Google fields
- * are optional and populated by the calendar OAuth flow — a tenant without
- * calendar connected just doesn't have them set.
+ * Required fields cover the meeting-bot routes; Google fields are optional and
+ * populated by the calendar OAuth flow — a tenant without calendar connected
+ * just doesn't have them set.
  */
 export interface TenantConfig {
   /** Neon HTTP connection string for this tenant's DB. */
   database_url: string;
-  /** HMAC secret used to sign/verify Recall webhook URLs. */
-  recall_webhook_secret: string;
   /** Bearer token clients pass in `Authorization` to act as this tenant. */
   tenant_key: string;
-
-  // ---- Bot provider switch (Recall → Vexa cutover) ---------------------
-  /**
-   * Which meeting-bot provider to dispatch for new meetings.
-   * Defaults to `"recall"` when unset. Flipping to `"vexa"` is the per-tenant
-   * cutover. In-flight Recall meetings continue on the Recall path because
-   * MeetingDO.alarm() reads this when the alarm fires, not at upsert time.
-   */
-  bot_provider?: "recall" | "vexa";
-
-  /**
-   * Default Vexa platform inferred from the meeting URL when this tenant runs
-   * mostly on one platform (e.g. always Google Meet). Optional; if absent,
-   * the platform is parsed from each meeting URL at dispatch time.
-   */
-  vexa_default_platform?: "google_meet" | "zoom" | "teams";
 
   /**
    * Per-tenant Vexa instance URL — e.g. `https://my-jarvis-vexa-yaronkra3.fly.dev`.
@@ -129,22 +108,14 @@ export type GoogleStatePatch = Partial<
 export interface AdminRegisterBody {
   slug: string;
   database_url: string;
-  recall_webhook_secret: string;
   tenant_key: string;
-  /**
-   * Bot provider — defaults to `"recall"` when omitted (preserves existing
-   * tenants on the original code path). Set to `"vexa"` to cut a tenant over
-   * to the Fly-hosted Vexa Lite. Persisted via the same `setTenantConfig`
-   * call so the next meeting alarm picks it up.
-   */
-  bot_provider?: "recall" | "vexa";
   /** Per-tenant Vexa instance URL (overrides env.VEXA_API_URL when set). */
   vexa_api_url?: string;
   /** Per-tenant Vexa user API key (overrides env.VEXA_API_KEY when set). */
   vexa_api_key?: string;
 }
 
-/** Body of `POST /recall/bot`. */
+/** Body of `POST /meeting/bot`. */
 export interface BotStartBody {
   meeting_url: string;
   title?: string;
@@ -161,26 +132,23 @@ export interface BotStartBody {
 }
 
 /**
- * Body of `POST /recall/play` (and the new `POST /play` provider-agnostic
- * variant). For Vexa, the `platform` and `native_meeting_id` fields are
- * required because Vexa's speak endpoint addresses the meeting by those, not
- * by `bot_id`. The dashboard already knows them — they're on the `meetings`
- * row.
+ * Body of `POST /meeting/play`. `platform` and `native_meeting_id` are required
+ * because Vexa's speak endpoint addresses the meeting by those, not by `bot_id`.
+ * The dashboard already knows them — they're on the `meetings` row.
  */
 export interface PlayBody {
   bot_id: string;
   b64_audio: string;
-  kind?: string;
-  /** Required when tenant `bot_provider` is `"vexa"`. Ignored for Recall. */
-  platform?: "google_meet" | "zoom" | "teams";
-  /** Required when tenant `bot_provider` is `"vexa"`. Ignored for Recall. */
-  native_meeting_id?: string;
+  /** Audio container format (default "wav"). */
+  kind?: "wav" | "mp3" | "pcm" | "opus";
+  platform: "google_meet" | "zoom" | "teams";
+  native_meeting_id: string;
 }
 
 /**
  * Body of `POST /vexa/transcript` — the Vexa→Worker relay. The relay
  * subscribes to Vexa's WebSocket and POSTs each transcript segment here.
- * Auth: bearer (tenant_key) + X-Tenant header, same as /recall/play.
+ * Auth: bearer (tenant_key) + X-Tenant header, same as /meeting/play.
  *
  * Identification: provide EITHER `bot_id` (if the relay tracks our internal
  * id) OR `(platform, native_meeting_id)` (the relay receives these directly
@@ -211,31 +179,30 @@ export interface VexaTranscriptBody {
 }
 
 /**
- * Body of `POST /recall/leave`.
- *
- * For Vexa tenants the platform + native_meeting_id are also required —
- * Vexa's stop endpoint is keyed by `(platform, native_meeting_id)`, not
- * by bot_id. Dashboard already has both on the meetings row; pass them
- * through. The Recall path ignores them.
+ * Body of `POST /meeting/leave`. Vexa's stop endpoint is keyed by
+ * `(platform, native_meeting_id)` — not by bot_id. Either pass them directly
+ * (the dashboard has them on the meetings row) or pass `meeting_url` as a
+ * fallback for the Worker to parse.
  */
 export interface LeaveBody {
   bot_id: string;
   platform?: "google_meet" | "zoom" | "teams";
   native_meeting_id?: string;
-  /** Optional fallback: Worker can parse platform + native_meeting_id from this. */
+  /** Fallback: Worker parses platform + native_meeting_id from this if the
+   * structured fields aren't supplied. */
   meeting_url?: string;
 }
 
 /**
- * Shape of a single transcript event we persist. Built from Recall's webhook
- * payload (event + data envelope).
+ * Shape of a single transcript event we persist. Built from Vexa's transcript
+ * envelope by `adaptVexaSegment` in `lib/vexa-transcript-adapter.ts`.
  */
 export interface TranscriptSegment {
   bot_id: string;
   speaker_name: string | null;
   speaker_id: string | null;
   is_host: boolean | null;
-  /** Joined transcript text (Recall sends words[]; we join into a single line). */
+  /** Joined transcript text — one line per segment. */
   words: string;
   start_ts: number | null;
   end_ts: number | null;
@@ -262,24 +229,18 @@ export interface MeetingState {
   title: string;
   meeting_url: string;
   status: "scheduled" | "dispatched" | "cancelled" | "failed" | "completed";
-  /**
-   * Active bot id from the dispatched provider. Field name kept for backward
-   * compat with existing Neon rows; semantically provider-agnostic.
-   */
-  recall_bot_id: string | null;
+  /** Active Vexa bot id once dispatched. */
+  bot_id: string | null;
   dispatched_at_ms: number | null;
-  /** FK into Neon `calendar_events.id` (or `meetings.id`) once dispatched. */
+  /** FK into Neon `meetings.id` once dispatched. */
   meeting_id_neon: number | null;
 
-  // ---- Vexa-only addressing (set when bot_provider=="vexa" was used) ----
-  /** Vexa platform — needed by /play and /leave to address the meeting. */
+  /** Vexa platform — needed by /meeting/play and /meeting/leave to address the meeting. */
   vexa_platform?: "google_meet" | "zoom" | "teams";
   /** Vexa native meeting id parsed from the meeting URL. */
   vexa_native_meeting_id?: string;
-  /** Which provider was actually dispatched (so reads can branch correctly). */
-  bot_provider?: "recall" | "vexa";
 
-  // ---- Vexa transcript-polling state (only used when bot_provider=="vexa") ----
+  // ---- Vexa transcript-polling state ----
   /**
    * ISO 8601 of the last segment we synced from Vexa to Neon. Each alarm tick
    * fetches the full transcript list, filters by `absolute_end_time > this`,
@@ -315,7 +276,7 @@ export interface MeetingState {
 
 /**
  * Body of `POST /_internal/upsert` on MeetingDO. Caller supplies the event
- * fields; the DO fills in computed status/recall/dispatched fields.
+ * fields; the DO fills in computed status/dispatched fields.
  *
  * `meeting_id` (Neon meetings.id) is supplied by the calendar pipeline so the
  * DO can persist it into MeetingState and use it to UPDATE the meetings row
