@@ -82,6 +82,18 @@ export interface TenantConfig {
    */
   vexa_default_platform?: "google_meet" | "zoom" | "teams";
 
+  /**
+   * Per-tenant Vexa instance URL — e.g. `https://my-jarvis-vexa-yaronkra3.fly.dev`.
+   * When set, MeetingDO dispatches this tenant's bots to this URL. When unset,
+   * falls back to `env.VEXA_API_URL` (the legacy single-shared-Vexa setup).
+   */
+  vexa_api_url?: string;
+  /**
+   * Per-tenant Vexa user API key minted on that tenant's Vexa instance.
+   * When set, MeetingDO uses this for `X-API-Key`. Falls back to env.VEXA_API_KEY.
+   */
+  vexa_api_key?: string;
+
   // ---- Google Calendar fields (set via /calendar/oauth/callback) ---------
   /** Long-lived Google OAuth refresh token. Exchanged for short-lived access tokens. */
   google_refresh_token?: string;
@@ -126,6 +138,10 @@ export interface AdminRegisterBody {
    * call so the next meeting alarm picks it up.
    */
   bot_provider?: "recall" | "vexa";
+  /** Per-tenant Vexa instance URL (overrides env.VEXA_API_URL when set). */
+  vexa_api_url?: string;
+  /** Per-tenant Vexa user API key (overrides env.VEXA_API_KEY when set). */
+  vexa_api_key?: string;
 }
 
 /** Body of `POST /recall/bot`. */
@@ -135,6 +151,13 @@ export interface BotStartBody {
   meeting_id?: string;
   /** Deepgram language code, e.g. "he", "en", "multi". Defaults to "he". */
   language?: string;
+  /**
+   * Zoom/Teams passcode. Optional — if the meeting URL already carries it
+   * (`?pwd=<token>` for Zoom), the parser extracts it and this field is
+   * ignored. Used when the user pastes a bare Zoom URL and types the
+   * passcode separately. Recall path ignores this field.
+   */
+  passcode?: string;
 }
 
 /**
@@ -269,11 +292,35 @@ export interface MeetingState {
    * still hasn't terminated, stop alarming so a wedged DO doesn't spin forever.
    */
   poll_started_ms?: number;
+  /**
+   * Wall-clock ms when we first observed Vexa reporting status='active' AND
+   * flipped meetings.status to 'live'. Once set, the polling loop stops
+   * issuing markMeetingLive UPDATEs (idempotent guard).
+   */
+  live_marked_at_ms?: number;
+  /**
+   * Wall-clock ms of the last poll tick where Vexa reported any human
+   * participants in the meeting. Used to detect "host left" — when this is
+   * set AND now()-this > grace period AND participants_count is 0, the
+   * polling loop force-leaves the bot for a clean shutdown.
+   */
+  last_human_seen_at_ms?: number;
+  /**
+   * Wall-clock ms when we issued vexaBotLeave because the host left. Idempotent
+   * guard — once set, we don't issue leave again, and we let Vexa transition
+   * to 'completed' naturally so markMeetingEnded can fire on the next tick.
+   */
+  leave_requested_at_ms?: number;
 }
 
 /**
  * Body of `POST /_internal/upsert` on MeetingDO. Caller supplies the event
  * fields; the DO fills in computed status/recall/dispatched fields.
+ *
+ * `meeting_id` (Neon meetings.id) is supplied by the calendar pipeline so the
+ * DO can persist it into MeetingState and use it to UPDATE the meetings row
+ * at dispatch time. Optional — manual flows that don't pre-create a row pass
+ * undefined and the DO leaves meeting_id_neon null.
  */
 export interface MeetingUpsertBody {
   tenant_slug: string;
@@ -282,6 +329,7 @@ export interface MeetingUpsertBody {
   end_time_ms: number;
   title: string;
   meeting_url: string;
+  meeting_id?: number | null;
 }
 
 /** Normalised calendar event extracted from Google's `events#resource` shape. */

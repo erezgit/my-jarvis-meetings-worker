@@ -210,6 +210,10 @@ export interface VexaTranscriptsResult {
   }>;
   /** Used to anchor relative timestamps (Vexa returns ISO 8601 absolutes). */
   start_time?: string | null;
+  /** Display names of humans currently in the meeting (excludes the bot). */
+  participants: string[];
+  /** Set once the meeting concludes — explains why ('stopped', 'idle_timeout', etc). */
+  completion_reason: string | null;
   /** Full raw payload — kept for debugging / future use. */
   raw: unknown;
 }
@@ -237,6 +241,7 @@ export async function getVexaTranscripts(opts: {
     status?: unknown;
     segments?: unknown;
     start_time?: unknown;
+    data?: unknown;
   };
   try {
     parsed = JSON.parse(text);
@@ -248,6 +253,23 @@ export async function getVexaTranscripts(opts: {
   const segs = Array.isArray(parsed.segments)
     ? (parsed.segments as VexaTranscriptsResult["segments"])
     : [];
+
+  // `data` envelope holds participants + completion_reason. Vexa keeps these
+  // here (not at top level) — verified against the live response shape.
+  const data =
+    parsed.data && typeof parsed.data === "object"
+      ? (parsed.data as Record<string, unknown>)
+      : {};
+  const participants = Array.isArray(data.participants)
+    ? (data.participants as unknown[]).filter(
+        (p): p is string => typeof p === "string",
+      )
+    : [];
+  const completionReason =
+    typeof data.completion_reason === "string"
+      ? (data.completion_reason as string)
+      : null;
+
   return {
     id: typeof parsed.id === "number" ? parsed.id : -1,
     status: (typeof parsed.status === "string"
@@ -256,19 +278,21 @@ export async function getVexaTranscripts(opts: {
     segments: segs,
     start_time:
       typeof parsed.start_time === "string" ? parsed.start_time : null,
+    participants,
+    completion_reason: completionReason,
     raw: parsed,
   };
 }
 
 /**
- * Parse a meeting URL into the (platform, native_meeting_id) pair Vexa
- * expects. Throws if the URL doesn't match a supported platform — the caller
- * should treat that as a fatal dispatch error and mark the MeetingState
+ * Parse a meeting URL into the (platform, native_meeting_id, passcode) tuple
+ * Vexa expects. Throws if the URL doesn't match a supported platform — the
+ * caller should treat that as a fatal dispatch error and mark the MeetingState
  * `failed` (same way the existing alarm handler treats a missing meeting_url).
  *
  * Patterns recognised (verified against docs.vexa.ai/meeting-ids):
  *   Google Meet: `https://meet.google.com/abc-defg-hij`
- *   Zoom:        `https://*.zoom.us/j/123456789(?pwd=...)`
+ *   Zoom:        `https://*.zoom.us/j/123456789(?pwd=...)` — `pwd` returned as passcode
  *   Teams:       `https://teams.microsoft.com/l/meetup-join/<encoded>` —
  *                Vexa uses the full URL-encoded `19:meeting_<id>@thread.v2`
  *                segment as the native id.
@@ -276,6 +300,7 @@ export async function getVexaTranscripts(opts: {
 export function parseVexaMeetingUrl(meetingUrl: string): {
   platform: VexaBotCreateOpts["platform"];
   nativeMeetingId: string;
+  passcode?: string;
 } {
   let u: URL;
   try {
@@ -294,13 +319,20 @@ export function parseVexaMeetingUrl(meetingUrl: string): {
     return { platform: "google_meet", nativeMeetingId: code };
   }
 
-  // Zoom — "<*>.zoom.us/j/<id>"
+  // Zoom — "<*>.zoom.us/j/<id>" with optional embedded `?pwd=<token>`.
+  // Most Zoom share-links carry pwd in the querystring; pulling it here lets
+  // the user paste a single URL and have the bot join without a second prompt.
   if (host.endsWith("zoom.us")) {
     const m = u.pathname.match(/\/j\/(\d+)/);
     if (!m) {
       throw new Error(`parseVexaMeetingUrl: bad Zoom path in ${meetingUrl}`);
     }
-    return { platform: "zoom", nativeMeetingId: m[1] };
+    const pwd = u.searchParams.get("pwd");
+    return {
+      platform: "zoom",
+      nativeMeetingId: m[1],
+      passcode: pwd && pwd.length > 0 ? pwd : undefined,
+    };
   }
 
   // Microsoft Teams — "teams.microsoft.com/l/meetup-join/<urlencoded id>/..."

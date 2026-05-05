@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predeploy": "git diff --quiet HEAD -- . ':!package-lock.json' || (echo '\\033[31m✗ uncommitted changes — commit first so git matches what ships to prod\\033[0m' && exit 1)",
     "deploy": "wrangler deploy",
     "deploy:dry": "wrangler deploy --dry-run",
     "typecheck": "tsc --noEmit"

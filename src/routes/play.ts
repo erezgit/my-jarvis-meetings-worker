@@ -58,15 +58,17 @@ export async function handleRecallPlay(
   const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
 
   if (provider === "vexa") {
-    if (!env.VEXA_API_URL || env.VEXA_API_URL.length === 0) {
+    const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
+    const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
+    if (!vexaUrl || vexaUrl.length === 0) {
       return json(
-        { ok: false, error: "VEXA_API_URL not configured on this worker" },
+        { ok: false, error: "vexa_api_url not configured (cfg or env)" },
         500,
       );
     }
-    if (!env.VEXA_API_KEY || env.VEXA_API_KEY.length === 0) {
+    if (!vexaKey || vexaKey.length === 0) {
       return json(
-        { ok: false, error: "VEXA_API_KEY not configured on this worker" },
+        { ok: false, error: "vexa_api_key not configured (cfg or env)" },
         500,
       );
     }
@@ -93,8 +95,8 @@ export async function handleRecallPlay(
         : "wav";
 
     const r = await vexaSpeak({
-      apiUrl: env.VEXA_API_URL,
-      apiKey: env.VEXA_API_KEY,
+      apiUrl: vexaUrl,
+      apiKey: vexaKey,
       platform: body.platform as "google_meet" | "zoom" | "teams",
       nativeMeetingId: body.native_meeting_id,
       audioBase64: body.b64_audio,

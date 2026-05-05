@@ -65,6 +65,12 @@ export class MeetingTenantDO {
         ...(body.bot_provider !== undefined
           ? { bot_provider: body.bot_provider }
           : {}),
+        ...(body.vexa_api_url !== undefined
+          ? { vexa_api_url: body.vexa_api_url }
+          : {}),
+        ...(body.vexa_api_key !== undefined
+          ? { vexa_api_key: body.vexa_api_key }
+          : {}),
       };
       await this.state.storage.put("config", cfg);
       this.cachedConfig = cfg;

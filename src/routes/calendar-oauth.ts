@@ -19,7 +19,7 @@ import {
   getTenantStub,
   setGoogleState,
 } from "../do";
-import { neon } from "@neondatabase/serverless";
+import { upsertCalendarMeeting } from "../lib/meeting-persistence";
 import type { Env, NormalisedCalendarEvent } from "../lib/types";
 
 /* --------------------------------------------------------------------------
@@ -173,13 +173,19 @@ export async function handleOAuthCallback(
 
   // 5) Spawn MeetingDOs for every event with a meeting URL. Best-effort —
   // any individual failure is logged and skipped; the reconcile cron will
-  // catch any miss.
+  // catch any miss. Persistence happens FIRST (so we can pass the meeting_id
+  // down into the DO) and the DO upsert second.
   ctx.waitUntil(
     Promise.all(
       fullSync.normalised
         .filter((ev) => ev.status !== "cancelled" && ev.meeting_url)
         .map(async (ev) => {
           try {
+            const persisted = await upsertCalendarMeeting({
+              databaseUrl: cfg.database_url,
+              tenantSlug: tenant,
+              ev,
+            });
             await upsertMeetingDO(env.MEETING_DO, {
               tenant_slug: tenant,
               google_event_id: ev.google_event_id,
@@ -187,8 +193,8 @@ export async function handleOAuthCallback(
               end_time_ms: ev.end_time_ms,
               title: ev.title,
               meeting_url: ev.meeting_url ?? "",
+              meeting_id: persisted.meeting_id,
             });
-            await persistCalendarEvent(cfg.database_url, tenant, ev);
           } catch (err) {
             console.error(
               `[oauth/callback] failed to schedule event=${ev.google_event_id}:`,
@@ -268,49 +274,6 @@ export async function getFreshAccessToken(opts: {
     clientSecret: opts.env.GOOGLE_OAUTH_CLIENT_SECRET,
   });
   return r.access_token;
-}
-
-/**
- * UPSERT a normalised event into the tenant's `calendar_events` table.
- * Schema assumed in PRD migration 006:
- *   calendar_events(google_event_id UNIQUE, title, start_time, end_time,
- *                   meeting_url, status, raw, ...)
- */
-export async function persistCalendarEvent(
-  databaseUrl: string,
-  _tenantSlug: string,
-  ev: NormalisedCalendarEvent,
-): Promise<void> {
-  const sql = neon(databaseUrl);
-  const startIso = new Date(ev.start_time_ms).toISOString();
-  const endIso = new Date(ev.end_time_ms).toISOString();
-  await sql`
-    INSERT INTO calendar_events (
-      google_event_id, title, start_time, end_time, meeting_url,
-      status, raw, created_at, updated_at
-    ) VALUES (
-      ${ev.google_event_id},
-      ${ev.title},
-      ${startIso},
-      ${endIso},
-      ${ev.meeting_url},
-      ${ev.status === "cancelled" ? "cancelled" : "scheduled"},
-      ${JSON.stringify(ev.raw)}::jsonb,
-      now(),
-      now()
-    )
-    ON CONFLICT (google_event_id) DO UPDATE SET
-      title = EXCLUDED.title,
-      start_time = EXCLUDED.start_time,
-      end_time = EXCLUDED.end_time,
-      meeting_url = EXCLUDED.meeting_url,
-      status = CASE
-        WHEN calendar_events.status = 'dispatched' THEN calendar_events.status
-        ELSE EXCLUDED.status
-      END,
-      raw = EXCLUDED.raw,
-      updated_at = now()
-  `;
 }
 
 /* --------------------------------------------------------------------------

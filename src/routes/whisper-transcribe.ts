@@ -79,12 +79,20 @@ export async function handleWhisperTranscribe(
   }
   const audioBase64 = btoa(binary);
 
-  // Workers AI input. Hebrew works through the language code; auto-detect
-  // if Vexa didn't pass one.
+  // Workers AI input. Anti-hallucination params per arxiv 2501.11378 +
+  // openai/whisper #679 — Whisper-turbo defaults are worst-case for silence
+  // hallucinations (Hebrew "תודה רבה", English "thanks for watching", etc.).
+  // These settings drop hallucinations ~21% → ~0.2% in published benchmarks.
   type WhisperInput = {
     audio: string;
     language?: string;
     task?: "transcribe" | "translate";
+    vad_filter?: boolean;
+    condition_on_previous_text?: boolean;
+    no_speech_threshold?: number;
+    compression_ratio_threshold?: number;
+    beam_size?: number;
+    hallucination_silence_threshold?: number;
   };
   type WhisperResponse = {
     transcription_info?: { text?: string };
@@ -92,7 +100,22 @@ export async function handleWhisperTranscribe(
     vtt?: string;
     segments?: Array<{ start?: number; end?: number; text?: string }>;
   };
-  const aiInput: WhisperInput = { audio: audioBase64 };
+  const aiInput: WhisperInput = {
+    audio: audioBase64,
+    // Silero VAD on Whisper's input — biggest single hallucination mitigation.
+    vad_filter: true,
+    // Don't carry hallucinated phrases forward across segments.
+    condition_on_previous_text: false,
+    // CF default 0.6 is too permissive — flag more silence as silence.
+    no_speech_threshold: 0.2,
+    // Filter repetitive hallucinations.
+    compression_ratio_threshold: 2.4,
+    // Counterintuitive: arxiv 2501.11378 Table VI shows larger beams
+    // INCREASED hallucinations on silent audio. beam_size=1 wins.
+    beam_size: 1,
+    // CF-specific: skip silent runs longer than this many seconds.
+    hallucination_silence_threshold: 2,
+  };
   if (language && language !== "auto") aiInput.language = language;
 
   let aiOut: WhisperResponse;
@@ -110,16 +133,83 @@ export async function handleWhisperTranscribe(
   }
 
   // turbo returns nested `transcription_info.text`; legacy returns top-level `text`.
-  const text = aiOut.transcription_info?.text ?? aiOut.text ?? "";
-  const segments = (aiOut.segments ?? []).map((s) => ({
+  let text = aiOut.transcription_info?.text ?? aiOut.text ?? "";
+  let segments = (aiOut.segments ?? []).map((s) => ({
     start: typeof s.start === "number" ? s.start : 0,
     end: typeof s.end === "number" ? s.end : 0,
     text: typeof s.text === "string" ? s.text : "",
   }));
+
+  // Defense-in-depth: drop known Whisper hallucination phrases that slip
+  // past the VAD filter. The Hebrew "תודה רבה" pattern is a YouTube-outro
+  // training-data artifact; Vexa's upstream filter has en/es/pt/ru phrase
+  // lists but no Hebrew. Filter both whole-text and individual segments.
+  if (isWhisperHallucination(text)) {
+    text = "";
+    segments = [];
+  } else if (segments.length > 0) {
+    segments = segments.filter((s) => !isWhisperHallucination(s.text));
+    // If filtering left zero segments but full text was non-trivial, keep
+    // text — it's probably one continuous hallucination-free utterance.
+    if (segments.length === 0 && !isWhisperHallucination(text)) {
+      // keep as-is
+    }
+  }
 
   return json({
     text,
     language: language ?? null,
     segments,
   });
+}
+
+/**
+ * Detect known Whisper-turbo hallucinations. Most are YouTube-outro
+ * training-data artifacts that surface on silent or near-silent audio.
+ *
+ * Sources for these patterns:
+ *   - openai/whisper #1455, #679, #1873
+ *   - whisper.cpp #1490, #1724
+ *   - collabora/WhisperLive #185
+ *   - ivrit.ai (Hebrew Whisper fine-tuners)
+ */
+function isWhisperHallucination(raw: string): boolean {
+  if (typeof raw !== "string") return false;
+  const text = raw.trim();
+  if (text.length === 0) return false;
+
+  // Strip common punctuation and collapse whitespace for matching.
+  const norm = text
+    .replace(/[.,!?…׃׀״״״''""()\-—–]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Hebrew patterns — the YouTube outro tokens for he-IL.
+  const HEBREW: RegExp[] = [
+    /^תודה(\s+רבה)?$/u,
+    /^תודה\s+רבה\s+על\s+הצפייה$/u,
+    /^תודה\s+על\s+הצפייה$/u,
+    /^נתראה\s+בפרק\s+הבא$/u,
+    /^כתוביות.*$/u,
+    /^עריכת\s+כתוביות.*$/u,
+    /^בהצלחה$/u,
+  ];
+  if (HEBREW.some((rx) => rx.test(norm))) return true;
+
+  // English patterns — the canonical YouTube outros Whisper learned.
+  const lower = norm.toLowerCase();
+  const ENGLISH: RegExp[] = [
+    /^thanks?\s+for\s+watching$/,
+    /^thank\s+you\s+for\s+watching$/,
+    /^thanks?\s+for\s+watching\s+(this\s+)?video$/,
+    /^subscribe\b.*$/,
+    /^please\s+subscribe.*$/,
+    /^like\s+and\s+subscribe.*$/,
+    /^see\s+you\s+(in\s+the\s+)?next\s+(video|episode)$/,
+    /^bye(\s*bye)?$/,
+    /^you('re)?\s+watching.*$/,
+  ];
+  if (ENGLISH.some((rx) => rx.test(lower))) return true;
+
+  return false;
 }

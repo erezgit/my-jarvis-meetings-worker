@@ -17,8 +17,11 @@ import {
 import type { RawCalendarEvent } from "../lib/google-calendar";
 import { getTenantByChannelId } from "../lib/kv-routing";
 import {
+  markMeetingCancelled,
+  upsertCalendarMeeting,
+} from "../lib/meeting-persistence";
+import {
   getFreshAccessToken,
-  persistCalendarEvent,
   runFullSync,
 } from "./calendar-oauth";
 import type { Env } from "../lib/types";
@@ -170,30 +173,34 @@ async function fullResync(opts: {
 
   const result = await runFullSync({ accessToken });
   for (const ev of result.normalised) {
+    // Persist FIRST (so we have meeting_id to thread into the DO upsert),
+    // then upsert the DO and any cancellation propagation.
+    let meetingId: number | null = null;
+    try {
+      const persisted = await upsertCalendarMeeting({
+        databaseUrl: cfg.database_url,
+        tenantSlug,
+        ev,
+      });
+      meetingId = persisted.meeting_id;
+    } catch (err) {
+      console.error(`[full-resync] persist failed event=${ev.google_event_id}:`, err);
+    }
+
     if (ev.status === "cancelled") {
-      // Cancel any DO we previously scheduled.
       try {
         await cancelMeetingDO(env.MEETING_DO, tenantSlug, ev.google_event_id);
       } catch (err) {
-        console.error(`[full-resync] cancel failed:`, err);
-      }
-      try {
-        await persistCalendarEvent(cfg.database_url, tenantSlug, ev);
-      } catch (err) {
-        console.error(`[full-resync] persist failed:`, err);
+        console.error(`[full-resync] cancel DO failed:`, err);
       }
       continue;
     }
+
     if (!ev.meeting_url) {
-      // No meeting URL → nothing for Recall to join. Persist for the
-      // dashboard list; don't spawn a DO.
-      try {
-        await persistCalendarEvent(cfg.database_url, tenantSlug, ev);
-      } catch (err) {
-        console.error(`[full-resync] persist (no url) failed:`, err);
-      }
+      // No meet link → nothing to dispatch.
       continue;
     }
+
     try {
       await upsertMeetingDO(env.MEETING_DO, {
         tenant_slug: tenantSlug,
@@ -202,14 +209,10 @@ async function fullResync(opts: {
         end_time_ms: ev.end_time_ms,
         title: ev.title,
         meeting_url: ev.meeting_url,
+        meeting_id: meetingId,
       });
     } catch (err) {
       console.error(`[full-resync] DO upsert failed:`, err);
-    }
-    try {
-      await persistCalendarEvent(cfg.database_url, tenantSlug, ev);
-    } catch (err) {
-      console.error(`[full-resync] persist failed:`, err);
     }
   }
 
@@ -235,18 +238,21 @@ async function applyDeltaEvent(opts: {
     try {
       await cancelMeetingDO(env.MEETING_DO, tenantSlug, raw.id);
     } catch (err) {
-      console.error(`[delta] cancel failed:`, err);
+      console.error(`[delta] cancel DO failed:`, err);
     }
+    // Look up the linked meeting_id (if any) so we can also flip meetings.
     try {
       const sql = (await import("@neondatabase/serverless")).neon(cfgDatabaseUrl);
-      await sql`
-        UPDATE calendar_events
-        SET status = CASE WHEN status = 'dispatched' THEN status ELSE 'cancelled' END,
-            updated_at = now()
-        WHERE google_event_id = ${raw.id}
-      `;
+      const linked = (await sql`
+        SELECT meeting_id FROM calendar_events WHERE google_event_id = ${raw.id}
+      `) as Array<{ meeting_id: number | null }>;
+      await markMeetingCancelled({
+        databaseUrl: cfgDatabaseUrl,
+        meetingId: linked[0]?.meeting_id ?? null,
+        googleEventId: raw.id,
+      });
     } catch (err) {
-      console.error(`[delta] persist cancel failed:`, err);
+      console.error(`[delta] mark cancelled failed:`, err);
     }
     return;
   }
@@ -254,14 +260,24 @@ async function applyDeltaEvent(opts: {
   const ev = normaliseEvent(raw);
   if (!ev) return;
 
+  // Persist FIRST so we have meeting_id for the DO upsert.
+  let meetingId: number | null = null;
+  try {
+    const persisted = await upsertCalendarMeeting({
+      databaseUrl: cfgDatabaseUrl,
+      tenantSlug,
+      ev,
+    });
+    meetingId = persisted.meeting_id;
+  } catch (err) {
+    console.error(`[delta] persist failed event=${ev.google_event_id}:`, err);
+  }
+
   if (!ev.meeting_url) {
-    try {
-      await persistCalendarEvent(cfgDatabaseUrl, tenantSlug, ev);
-    } catch (err) {
-      console.error(`[delta] persist (no url) failed:`, err);
-    }
+    // No meet link → no DO to spawn.
     return;
   }
+
   try {
     await upsertMeetingDO(env.MEETING_DO, {
       tenant_slug: tenantSlug,
@@ -270,14 +286,10 @@ async function applyDeltaEvent(opts: {
       end_time_ms: ev.end_time_ms,
       title: ev.title,
       meeting_url: ev.meeting_url,
+      meeting_id: meetingId,
     });
   } catch (err) {
     console.error(`[delta] DO upsert failed:`, err);
-  }
-  try {
-    await persistCalendarEvent(cfgDatabaseUrl, tenantSlug, ev);
-  } catch (err) {
-    console.error(`[delta] persist failed:`, err);
   }
 }
 

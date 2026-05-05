@@ -5,15 +5,20 @@ import type {
 } from "@cloudflare/workers-types";
 import { fetchTenantConfig, getTenantStub } from "./do";
 import { hmacSha256Hex } from "./lib/hmac";
-import { neon } from "@neondatabase/serverless";
 import { createRecallBot, recallBotLeave } from "./lib/recall-bot";
 import {
   createVexaBot,
   getVexaTranscripts,
   parseVexaMeetingUrl,
+  vexaBotLeave,
 } from "./lib/vexa-bot";
 import { adaptVexaSegment } from "./lib/vexa-transcript-adapter";
 import { insertTranscriptSegment } from "./lib/neon";
+import {
+  markMeetingDispatched,
+  markMeetingEnded,
+  markMeetingLive,
+} from "./lib/meeting-persistence";
 import type {
   Env,
   MeetingState,
@@ -75,6 +80,8 @@ export class MeetingDO {
 
       // Preserve dispatch state across upserts — if we already fired the bot
       // we don't want a calendar update to flip status back to 'scheduled'.
+      // Prefer existing meeting_id_neon (set at first persist) over body.meeting_id
+      // — the FK never changes once set.
       const next: MeetingState = {
         tenant_slug: body.tenant_slug,
         google_event_id: body.google_event_id,
@@ -85,7 +92,8 @@ export class MeetingDO {
         status: existing?.status === "dispatched" ? "dispatched" : "scheduled",
         recall_bot_id: existing?.recall_bot_id ?? null,
         dispatched_at_ms: existing?.dispatched_at_ms ?? null,
-        meeting_id_neon: existing?.meeting_id_neon ?? null,
+        meeting_id_neon:
+          existing?.meeting_id_neon ?? body.meeting_id ?? null,
       };
       await this.state.storage.put("state", next);
 
@@ -266,17 +274,19 @@ export class MeetingDO {
     let vexaNativeId: string | undefined;
 
     if (provider === "vexa") {
-      // Vexa pre-flight: must have a configured Vexa instance. If the tenant
-      // is flipped without secrets in place, fail loudly rather than silently
-      // falling back to Recall.
-      if (!this.env.VEXA_API_URL || this.env.VEXA_API_URL.length === 0) {
+      // Vexa pre-flight: must have a configured Vexa instance. Per-tenant
+      // config takes precedence; falls back to worker env for tenants that
+      // haven't migrated to per-tenant Fly apps yet.
+      const vexaUrl = cfg.vexa_api_url || this.env.VEXA_API_URL;
+      const vexaKey = cfg.vexa_api_key || this.env.VEXA_API_KEY;
+      if (!vexaUrl || vexaUrl.length === 0) {
         throw new Error(
-          `[meeting-do.alarm] tenant ${s.tenant_slug} bot_provider=vexa but VEXA_API_URL not set`,
+          `[meeting-do.alarm] tenant ${s.tenant_slug} bot_provider=vexa but no vexa_api_url (cfg or env)`,
         );
       }
-      if (!this.env.VEXA_API_KEY || this.env.VEXA_API_KEY.length === 0) {
+      if (!vexaKey || vexaKey.length === 0) {
         throw new Error(
-          `[meeting-do.alarm] tenant ${s.tenant_slug} bot_provider=vexa but VEXA_API_KEY not set`,
+          `[meeting-do.alarm] tenant ${s.tenant_slug} bot_provider=vexa but no vexa_api_key (cfg or env)`,
         );
       }
 
@@ -286,8 +296,8 @@ export class MeetingDO {
 
       try {
         const out = await createVexaBot({
-          apiUrl: this.env.VEXA_API_URL,
-          apiKey: this.env.VEXA_API_KEY,
+          apiUrl: vexaUrl,
+          apiKey: vexaKey,
           platform: parsed.platform,
           nativeMeetingId: parsed.nativeMeetingId,
           language: "he",
@@ -328,15 +338,14 @@ export class MeetingDO {
 
     const dispatchedAt = Date.now();
 
-    // Persist into Neon — single source of truth for the dashboard. We write
-    // BOTH `calendar_events` (the upcoming-meetings list) and `meetings` (the
-    // existing transcript table — its `bot_id` is what /recall/webhook joins
-    // on).
-    let meetingIdNeon: number | null = null;
+    // Mark the meeting dispatched in Neon — UPDATEs the meetings row that
+    // upsertCalendarMeeting created (status: scheduled → live, sets bot_id)
+    // and the calendar_events row (status: scheduled → dispatched).
     try {
-      meetingIdNeon = await persistDispatchedMeeting({
+      await markMeetingDispatched({
         databaseUrl: cfg.database_url,
-        state: s,
+        meetingId: s.meeting_id_neon,
+        googleEventId: s.google_event_id,
         botId: result.bot_id,
         dispatchedAtMs: dispatchedAt,
       });
@@ -345,7 +354,7 @@ export class MeetingDO {
       // important than the Neon row. Log and continue; the reconcile cron
       // can re-attempt the Neon write.
       console.error(
-        `[meeting-do.alarm] neon persist failed event=${s.google_event_id} bot=${result.bot_id}:`,
+        `[meeting-do.alarm] neon mark-dispatched failed event=${s.google_event_id} bot=${result.bot_id}:`,
         err,
       );
     }
@@ -355,7 +364,7 @@ export class MeetingDO {
       status: "dispatched",
       recall_bot_id: result.bot_id,
       dispatched_at_ms: dispatchedAt,
-      meeting_id_neon: meetingIdNeon,
+      meeting_id_neon: s.meeting_id_neon,
       bot_provider: provider,
       vexa_platform: vexaPlatform,
       vexa_native_meeting_id: vexaNativeId,
@@ -401,18 +410,36 @@ export class MeetingDO {
       );
       const next: MeetingState = { ...s, status: "completed" };
       await this.state.storage.put("state", next);
+      // Reflect into Neon — fetch tenant config for the database URL.
+      try {
+        const tenantStub = getTenantStub(
+          this.env.MEETING_TENANT,
+          s.tenant_slug,
+        );
+        const cfg = await fetchTenantConfig(tenantStub, s.tenant_slug);
+        if (cfg) {
+          await markMeetingEnded({
+            databaseUrl: cfg.database_url,
+            meetingId: s.meeting_id_neon,
+            botId: s.recall_bot_id,
+          });
+        }
+      } catch (err) {
+        console.error(
+          `[meeting-do.poll] mark-ended (budget) failed event=${s.google_event_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
       return;
     }
 
     if (
-      !this.env.VEXA_API_URL ||
-      !this.env.VEXA_API_KEY ||
       !s.vexa_platform ||
       !s.vexa_native_meeting_id ||
       !s.recall_bot_id
     ) {
       console.error(
-        `[meeting-do.poll] missing config event=${s.google_event_id} — re-alarming`,
+        `[meeting-do.poll] missing state event=${s.google_event_id} — re-alarming`,
       );
       await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
       return;
@@ -427,12 +454,21 @@ export class MeetingDO {
       await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
       return;
     }
+    const vexaUrl = cfg.vexa_api_url || this.env.VEXA_API_URL;
+    const vexaKey = cfg.vexa_api_key || this.env.VEXA_API_KEY;
+    if (!vexaUrl || !vexaKey) {
+      console.error(
+        `[meeting-do.poll] no vexa creds (cfg or env) slug=${s.tenant_slug}`,
+      );
+      await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
+      return;
+    }
 
     let result;
     try {
       result = await getVexaTranscripts({
-        apiUrl: this.env.VEXA_API_URL,
-        apiKey: this.env.VEXA_API_KEY,
+        apiUrl: vexaUrl,
+        apiKey: vexaKey,
         platform: s.vexa_platform,
         nativeMeetingId: s.vexa_native_meeting_id,
       });
@@ -488,6 +524,74 @@ export class MeetingDO {
       );
     }
 
+    // First-time transition to live: Vexa reports status='active' AND we
+    // haven't flipped meetings.status yet. The bot is now actually in the
+    // meeting and recording — that's what the dashboard's 'live' label means.
+    let liveMarkedAtMs = s.live_marked_at_ms;
+    if (result.status === "active" && !liveMarkedAtMs) {
+      try {
+        await markMeetingLive({
+          databaseUrl: cfg.database_url,
+          meetingId: s.meeting_id_neon,
+          botId: s.recall_bot_id,
+        });
+        liveMarkedAtMs = Date.now();
+        console.log(
+          `[meeting-do.poll] event=${s.google_event_id} marked live (vexa active)`,
+        );
+      } catch (err) {
+        console.error(
+          `[meeting-do.poll] mark-live failed event=${s.google_event_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
+    // Track participant presence for clean-shutdown detection. Vexa returns
+    // `participants` (display-name array) on the /transcripts endpoint; the
+    // bot itself is NOT in this list, only humans. Update the watermark every
+    // tick where we see at least one human.
+    let lastHumanSeenAtMs = s.last_human_seen_at_ms;
+    if (result.participants.length > 0) {
+      lastHumanSeenAtMs = Date.now();
+    }
+
+    // Host-left detection: bot has been live, we've seen humans at some point,
+    // and they've all been gone for 30s straight. Force-leave so Vexa flips
+    // status to 'completed' on the next tick, which fires markMeetingEnded
+    // and stops polling. Idempotent via leave_requested_at_ms — we only issue
+    // the leave once per meeting.
+    const HOST_GRACE_MS = 30_000;
+    let leaveRequestedAtMs = s.leave_requested_at_ms;
+    const hostLeft =
+      liveMarkedAtMs !== undefined &&
+      lastHumanSeenAtMs !== undefined &&
+      result.participants.length === 0 &&
+      Date.now() - lastHumanSeenAtMs > HOST_GRACE_MS &&
+      result.status === "active" &&
+      !leaveRequestedAtMs;
+
+    if (hostLeft) {
+      console.log(
+        `[meeting-do.poll] event=${s.google_event_id} host left (no participants for ${HOST_GRACE_MS}ms) — issuing vexaBotLeave`,
+      );
+      try {
+        await vexaBotLeave({
+          apiUrl: vexaUrl,
+          apiKey: vexaKey,
+          platform: s.vexa_platform!,
+          nativeMeetingId: s.vexa_native_meeting_id!,
+        });
+        leaveRequestedAtMs = Date.now();
+      } catch (err) {
+        console.error(
+          `[meeting-do.poll] vexa leave failed event=${s.google_event_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+        // Don't throw — try again next tick.
+      }
+    }
+
     // Persist new watermark + maybe transition to terminal.
     const isTerminal =
       result.status === "completed" || result.status === "failed";
@@ -501,6 +605,9 @@ export class MeetingDO {
       ...s,
       last_synced_iso: newWatermark || undefined,
       status: nextStatus,
+      live_marked_at_ms: liveMarkedAtMs,
+      last_human_seen_at_ms: lastHumanSeenAtMs,
+      leave_requested_at_ms: leaveRequestedAtMs,
     };
     await this.state.storage.put("state", next);
 
@@ -510,6 +617,20 @@ export class MeetingDO {
       console.log(
         `[meeting-do.poll] event=${s.google_event_id} Vexa status=${result.status} — polling stopped`,
       );
+      // Reflect the terminal status into Neon so the dashboard list flips
+      // from 'live' to 'ended'/'failed'. Best-effort.
+      try {
+        await markMeetingEnded({
+          databaseUrl: cfg.database_url,
+          meetingId: s.meeting_id_neon,
+          botId: s.recall_bot_id,
+        });
+      } catch (err) {
+        console.error(
+          `[meeting-do.poll] mark-ended failed event=${s.google_event_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
     }
   }
 }
@@ -631,75 +752,6 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
-}
-
-/**
- * Persist the dispatched meeting into tenant Neon. Writes:
- *   - `calendar_events` (UPSERT — created on initial sync, status flipped to dispatched here)
- *   - `meetings` (INSERT — provides the bot_id row that /recall/webhook joins on)
- *
- * Returns calendar_events.id for back-reference in DO state.
- *
- * Schema assumed (per Neon migration `006_calendar_events.sql` in PRD):
- *   calendar_events(id, tenant_id?, google_event_id UNIQUE, title, start_time TIMESTAMPTZ,
- *                   end_time TIMESTAMPTZ, meeting_url, status, recall_bot_id,
- *                   dispatched_at TIMESTAMPTZ, raw JSONB, created_at, updated_at)
- *   meetings(id, bot_id UNIQUE, title, meeting_url, language, started_at)
- */
-async function persistDispatchedMeeting(opts: {
-  databaseUrl: string;
-  state: MeetingState;
-  botId: string;
-  dispatchedAtMs: number;
-}): Promise<number | null> {
-  const sql = neon(opts.databaseUrl);
-  const startIso = new Date(opts.state.start_time_ms).toISOString();
-  const endIso = new Date(opts.state.end_time_ms).toISOString();
-  const dispatchedIso = new Date(opts.dispatchedAtMs).toISOString();
-
-  // 1) Upsert into calendar_events. ON CONFLICT on google_event_id flips
-  // status to 'dispatched' and stamps recall_bot_id + dispatched_at.
-  const ceRows = (await sql`
-    INSERT INTO calendar_events (
-      google_event_id, title, start_time, end_time, meeting_url,
-      status, recall_bot_id, dispatched_at, raw, created_at, updated_at
-    ) VALUES (
-      ${opts.state.google_event_id},
-      ${opts.state.title},
-      ${startIso},
-      ${endIso},
-      ${opts.state.meeting_url},
-      'dispatched',
-      ${opts.botId},
-      ${dispatchedIso},
-      ${JSON.stringify({})}::jsonb,
-      now(),
-      now()
-    )
-    ON CONFLICT (google_event_id) DO UPDATE SET
-      status = 'dispatched',
-      recall_bot_id = EXCLUDED.recall_bot_id,
-      dispatched_at = EXCLUDED.dispatched_at,
-      updated_at = now()
-    RETURNING id
-  `) as Array<{ id: number }>;
-
-  // 2) Insert into meetings (the table /recall/webhook joins on via bot_id).
-  // Idempotent via ON CONFLICT (bot_id) — Recall bot ids are unique already
-  // but the cron may retry persistDispatchedMeeting after a Neon failure.
-  await sql`
-    INSERT INTO meetings (bot_id, title, meeting_url, language, started_at)
-    VALUES (
-      ${opts.botId},
-      ${opts.state.title},
-      ${opts.state.meeting_url},
-      'he',
-      ${startIso}
-    )
-    ON CONFLICT (bot_id) DO NOTHING
-  `;
-
-  return ceRows[0]?.id ?? null;
 }
 
 // Re-export so type-only consumers don't need to reach into ./lib/types.

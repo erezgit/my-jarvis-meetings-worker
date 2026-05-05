@@ -58,15 +58,19 @@ export async function handleRecallBot(
   const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
 
   if (provider === "vexa") {
-    if (!env.VEXA_API_URL || env.VEXA_API_URL.length === 0) {
+    // Per-tenant config takes precedence; falls back to worker env for tenants
+    // that haven't migrated to per-tenant Fly Vexa apps yet.
+    const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
+    const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
+    if (!vexaUrl || vexaUrl.length === 0) {
       return json(
-        { ok: false, error: "VEXA_API_URL not configured on this worker" },
+        { ok: false, error: "vexa_api_url not configured (cfg or env)" },
         500,
       );
     }
-    if (!env.VEXA_API_KEY || env.VEXA_API_KEY.length === 0) {
+    if (!vexaKey || vexaKey.length === 0) {
       return json(
-        { ok: false, error: "VEXA_API_KEY not configured on this worker" },
+        { ok: false, error: "vexa_api_key not configured (cfg or env)" },
         500,
       );
     }
@@ -86,12 +90,22 @@ export async function handleRecallBot(
         ? body.language
         : "he";
 
+    // Passcode resolution: URL-embedded `?pwd=` wins over the body field, since
+    // a passcode baked into the share-link is the meeting host's authoritative
+    // copy. Body field is the fallback when the user pastes a bare URL.
+    const passcode =
+      parsed.passcode ??
+      (typeof body.passcode === "string" && body.passcode.length > 0
+        ? body.passcode
+        : undefined);
+
     try {
       const out = await createVexaBot({
-        apiUrl: env.VEXA_API_URL,
-        apiKey: env.VEXA_API_KEY,
+        apiUrl: vexaUrl,
+        apiKey: vexaKey,
         platform: parsed.platform,
         nativeMeetingId: parsed.nativeMeetingId,
+        passcode,
         language: vexaLanguage,
         task: "transcribe",
         botName: "Jarvis",

@@ -48,8 +48,10 @@ export async function handleRecallLeave(
   const provider: "recall" | "vexa" = cfg.bot_provider ?? "recall";
 
   if (provider === "vexa") {
-    if (!env.VEXA_API_URL || !env.VEXA_API_KEY) {
-      return json({ ok: false, error: "vexa not configured" }, 500);
+    const vexaUrl = cfg.vexa_api_url || env.VEXA_API_URL;
+    const vexaKey = cfg.vexa_api_key || env.VEXA_API_KEY;
+    if (!vexaUrl || !vexaKey) {
+      return json({ ok: false, error: "vexa not configured (cfg or env)" }, 500);
     }
     // Resolve (platform, native_meeting_id). Prefer body, fall back to URL parse.
     let platform = body.platform;
@@ -75,8 +77,8 @@ export async function handleRecallLeave(
     }
     try {
       await vexaBotLeave({
-        apiUrl: env.VEXA_API_URL,
-        apiKey: env.VEXA_API_KEY,
+        apiUrl: vexaUrl,
+        apiKey: vexaKey,
         platform,
         nativeMeetingId: nativeId,
       });
