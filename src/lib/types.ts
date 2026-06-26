@@ -120,7 +120,7 @@ export interface BotStartBody {
   meeting_url: string;
   title?: string;
   meeting_id?: string;
-  /** Deepgram language code, e.g. "he", "en", "multi". Defaults to "he". */
+  /** Whisper language code, e.g. "he", "en", "multi". Defaults to "he". */
   language?: string;
   /**
    * Zoom/Teams passcode. Optional — if the meeting URL already carries it
@@ -272,6 +272,30 @@ export interface MeetingState {
    * to 'completed' naturally so markMeetingEnded can fire on the next tick.
    */
   leave_requested_at_ms?: number;
+  /**
+   * Current transcript-poll backoff in ms. Starts at the base interval (5s),
+   * doubles on each consecutive Vexa fetch error / 429 up to a 30s cap, and
+   * resets to the base on a successful fetch. Prevents the old 1s hammer that
+   * flooded Vexa with 429s.
+   */
+  poll_backoff_ms?: number;
+}
+
+/**
+ * Pointer (stored in MeetingTenantDO under "active_meeting") to the tenant's
+ * single currently-active meeting. The per-tenant Vexa instance allows only
+ * one bot at a time, so starting a NEW meeting first supersedes this one —
+ * leaves its Vexa bot + cancels its MeetingDO — before creating the new bot.
+ * This is what makes "start, stop the agent, start again on any link" always
+ * work, and guarantees only one transcript-poller runs per tenant.
+ */
+export interface ActiveMeeting {
+  /** MeetingDO key suffix (google_event_id) — e.g. "manual-<bot_id>". */
+  event_id: string;
+  bot_id: string;
+  platform: "google_meet" | "zoom" | "teams";
+  native_meeting_id: string;
+  meeting_id_neon: number | null;
 }
 
 /**

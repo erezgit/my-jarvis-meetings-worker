@@ -5,6 +5,7 @@ import type {
 } from "@cloudflare/workers-types";
 import { insertTranscriptSegment } from "./lib/neon";
 import type {
+  ActiveMeeting,
   Env,
   GoogleStatePatch,
   TenantConfig,
@@ -144,6 +145,49 @@ export class MeetingTenantDO {
       return jsonResponse({ ok: true });
     }
 
+    // ---- Active-meeting pointer (single live meeting per tenant) ----------
+    if (url.pathname === "/_internal/get-active-meeting" && method === "GET") {
+      const am =
+        (await this.state.storage.get<ActiveMeeting>("active_meeting")) ?? null;
+      if (!am) return jsonResponse({ ok: false, error: "none" }, 404);
+      return jsonResponse(am);
+    }
+
+    if (url.pathname === "/_internal/set-active-meeting" && method === "POST") {
+      const am = (await request.json()) as ActiveMeeting;
+      if (
+        typeof am?.event_id !== "string" ||
+        typeof am?.bot_id !== "string" ||
+        typeof am?.platform !== "string" ||
+        typeof am?.native_meeting_id !== "string"
+      ) {
+        return jsonResponse({ ok: false, error: "invalid active-meeting" }, 400);
+      }
+      await this.state.storage.put("active_meeting", am);
+      return jsonResponse({ ok: true });
+    }
+
+    if (
+      url.pathname === "/_internal/clear-active-meeting" &&
+      method === "POST"
+    ) {
+      // Optional body { bot_id } — only clear if it still points at this bot,
+      // so a meeting ending late doesn't wipe a newer meeting's pointer.
+      let onlyBotId: string | null = null;
+      try {
+        const b = (await request.json()) as { bot_id?: string };
+        if (typeof b?.bot_id === "string") onlyBotId = b.bot_id;
+      } catch {
+        /* no body — unconditional clear */
+      }
+      const am =
+        (await this.state.storage.get<ActiveMeeting>("active_meeting")) ?? null;
+      if (am && (onlyBotId === null || am.bot_id === onlyBotId)) {
+        await this.state.storage.delete("active_meeting");
+      }
+      return jsonResponse({ ok: true, cleared: Boolean(am) });
+    }
+
     return new Response(
       "meeting-tenant-do — access via internal namespace only",
       { status: 410 },
@@ -267,6 +311,58 @@ export async function clearGoogleState(
   );
   if (!r.ok) {
     throw new Error(`MeetingTenantDO clear-google-state failed: ${r.status}`);
+  }
+}
+
+/** Read the tenant's currently-active meeting pointer, or null. */
+export async function getActiveMeeting(
+  stub: DurableObjectStub,
+  slug: string,
+): Promise<ActiveMeeting | null> {
+  const r = await stub.fetch(internalUrl("/_internal/get-active-meeting", slug), {
+    method: "GET",
+  });
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    throw new Error(`MeetingTenantDO get-active-meeting failed: ${r.status}`);
+  }
+  return (await r.json()) as ActiveMeeting;
+}
+
+/** Set the tenant's currently-active meeting pointer. */
+export async function setActiveMeeting(
+  stub: DurableObjectStub,
+  slug: string,
+  am: ActiveMeeting,
+): Promise<void> {
+  const r = await stub.fetch(internalUrl("/_internal/set-active-meeting", slug), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(am),
+  });
+  if (!r.ok) {
+    throw new Error(`MeetingTenantDO set-active-meeting failed: ${r.status}`);
+  }
+}
+
+/** Clear the active-meeting pointer. If `botId` is given, only clears when the
+ * pointer still references that bot (avoids a late-ending meeting wiping a
+ * newer one's pointer). */
+export async function clearActiveMeeting(
+  stub: DurableObjectStub,
+  slug: string,
+  botId?: string,
+): Promise<void> {
+  const r = await stub.fetch(
+    internalUrl("/_internal/clear-active-meeting", slug),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(botId ? { bot_id: botId } : {}),
+    },
+  );
+  if (!r.ok) {
+    throw new Error(`MeetingTenantDO clear-active-meeting failed: ${r.status}`);
   }
 }
 

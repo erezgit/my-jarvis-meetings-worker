@@ -3,7 +3,7 @@ import type {
   DurableObjectState,
   DurableObjectStub,
 } from "@cloudflare/workers-types";
-import { fetchTenantConfig, getTenantStub } from "./do";
+import { clearActiveMeeting, fetchTenantConfig, getTenantStub } from "./do";
 import {
   createVexaBot,
   getVexaTranscripts,
@@ -365,7 +365,13 @@ export class MeetingDO {
    * transient Vexa hiccup doesn't permanently stop polling.
    */
   private async pollVexaTranscriptsTick(s: MeetingState): Promise<void> {
-    const RE_ALARM_MS = 1_000;
+    // Base poll cadence. The old value was 1s, which — multiplied by stale
+    // pollers that never stopped — flooded Vexa with 429s. 5s is plenty for a
+    // near-real-time transcript feed (Workers AI Whisper adds seconds anyway).
+    const RE_ALARM_MS = 5_000;
+    // On a Vexa fetch error / 429 we back off exponentially up to this cap
+    // instead of re-hammering at the base interval.
+    const MAX_POLL_BACKOFF_MS = 30_000;
     const HARD_BUDGET_MS = 4 * 60 * 60 * 1000; // 4 hours
     const POLL_BUDGET_EXCEEDED =
       s.poll_started_ms !== undefined &&
@@ -391,6 +397,7 @@ export class MeetingDO {
             botId: s.bot_id,
           });
         }
+        await clearActiveMeeting(tenantStub, s.tenant_slug, s.bot_id ?? undefined);
       } catch (err) {
         console.error(
           `[meeting-do.poll] mark-ended (budget) failed event=${s.google_event_id}:`,
@@ -444,8 +451,15 @@ export class MeetingDO {
         `[meeting-do.poll] fetch failed event=${s.google_event_id}:`,
         err instanceof Error ? err.message : err,
       );
-      // Transient — try again next tick.
-      await this.state.storage.setAlarm(Date.now() + RE_ALARM_MS);
+      // Transient (network blip / Vexa 429). Back off exponentially so a
+      // struggling box isn't hammered — doubles each consecutive failure up to
+      // the cap, resets to base on the next success.
+      const backoff = Math.min(
+        (s.poll_backoff_ms ?? RE_ALARM_MS) * 2,
+        MAX_POLL_BACKOFF_MS,
+      );
+      await this.state.storage.put("state", { ...s, poll_backoff_ms: backoff });
+      await this.state.storage.setAlarm(Date.now() + backoff);
       return;
     }
 
@@ -575,6 +589,8 @@ export class MeetingDO {
       live_marked_at_ms: liveMarkedAtMs,
       last_human_seen_at_ms: lastHumanSeenAtMs,
       leave_requested_at_ms: leaveRequestedAtMs,
+      // Successful fetch — reset any error backoff to the base cadence.
+      poll_backoff_ms: RE_ALARM_MS,
     };
     await this.state.storage.put("state", next);
 
@@ -595,6 +611,16 @@ export class MeetingDO {
       } catch (err) {
         console.error(
           `[meeting-do.poll] mark-ended failed event=${s.google_event_id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      // Release the tenant's active-meeting slot (only if it still points at
+      // this bot) so the pointer never goes stale.
+      try {
+        await clearActiveMeeting(tenantStub, s.tenant_slug, s.bot_id ?? undefined);
+      } catch (err) {
+        console.error(
+          `[meeting-do.poll] clear-active failed event=${s.google_event_id}:`,
           err instanceof Error ? err.message : err,
         );
       }
