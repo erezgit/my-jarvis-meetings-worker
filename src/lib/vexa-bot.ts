@@ -49,7 +49,7 @@ export async function createVexaBot(
 ): Promise<VexaBotCreateResult> {
   const language = opts.language && opts.language.length > 0 ? opts.language : "he";
   const task = opts.task ?? "transcribe";
-  const botName = opts.botName && opts.botName.length > 0 ? opts.botName : "Jarvis";
+  const botName = opts.botName && opts.botName.length > 0 ? opts.botName : "TaylorMind Notetaker";
 
   const body: Record<string, unknown> = {
     platform: opts.platform,
@@ -59,6 +59,11 @@ export async function createVexaBot(
     bot_name: botName,
     recording_enabled: opts.recordingEnabled ?? true,
     transcribe_enabled: opts.transcribeEnabled ?? true,
+    // Join Google Meet SIGNED IN as the shared "TaylorMind Notetaker" Google account.
+    // meeting-api reads this and injects the R2 creds + userdataS3Path into BOT_CONFIG
+    // so the bot restores the signed-in browser profile from R2 (clears Google's
+    // anonymous-bot block). Old images without the wiring ignore this field.
+    authenticated: true,
   };
   if (opts.passcode && opts.passcode.length > 0) {
     body.passcode = opts.passcode;
