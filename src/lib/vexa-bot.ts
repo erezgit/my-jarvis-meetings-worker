@@ -106,6 +106,102 @@ export async function createVexaBot(
   };
 }
 
+export interface VexaReadyResult {
+  ready: true;
+  /** Total wall-clock ms spent waiting (≈0 for an already-warm box). */
+  waitedMs: number;
+  /** How many probes it took (1 = warm). */
+  probes: number;
+}
+
+/**
+ * Wake a tenant's Vexa Fly machine and block until its bot-manager is ready to
+ * spawn a bot container — or throw after `capMs`.
+ *
+ * WHY THIS EXISTS (root-cause fix): the per-tenant Vexa box runs on Fly with
+ * `auto_stop_machines = "suspend"` + `min_machines_running = 0`, so it SLEEPS
+ * whenever no meeting is active (deliberately — it keeps the box at ~$5/mo).
+ * The first meeting after idle wakes it, but the box boots in stages
+ * (embedded Postgres → whisper → Vexa pre-flight → supervisord → API gateway +
+ * bot-manager + Docker). The API gateway answers `GET /` (and the Fly proxy
+ * lets the request through) BEFORE the bot-manager/Docker are up. A bot create
+ * fired in that window fails with no bot — which is exactly what users saw as
+ * "meetings not working". A plain retry loop that only pokes `POST /bots` gives
+ * up long before a cold boot (30–90s) finishes.
+ *
+ * THE READINESS SIGNAL is `GET /bots/status`: it queries the container manager,
+ * so a 200 with a `running_bots` array proves the exact subsystem a subsequent
+ * `POST /bots` needs is up. Hitting it ALSO triggers Fly's `auto_start`, so this
+ * single call both WAKES the machine and GATES on true readiness.
+ *
+ * Cost stays untouched — the box still suspends when idle; we just refuse to
+ * dispatch until it has finished waking. A warm box passes on the first probe
+ * (≈instant); a cold box costs one wake, capped hard at `capMs`.
+ */
+export async function waitForVexaReady(opts: {
+  apiUrl: string;
+  apiKey: string;
+  /** Hard ceiling on the total wait before giving up. Default 120_000 (2 min). */
+  capMs?: number;
+  /** Delay between probes. Default 4_000. */
+  probeIntervalMs?: number;
+  /** Per-probe fetch timeout so one hung probe can't eat the whole budget. Default 10_000. */
+  probeTimeoutMs?: number;
+}): Promise<VexaReadyResult> {
+  const capMs = opts.capMs ?? 120_000;
+  const probeIntervalMs = opts.probeIntervalMs ?? 4_000;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
+  const url = `${trimTrailingSlash(opts.apiUrl)}/bots/status`;
+  const startedAt = Date.now();
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  let probes = 0;
+  let lastReason = "no probe completed";
+  while (Date.now() - startedAt < capMs) {
+    probes++;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), probeTimeoutMs);
+    try {
+      const r = await fetch(url, {
+        method: "GET",
+        headers: { "X-API-Key": opts.apiKey },
+        signal: ac.signal,
+      });
+      if (r.ok) {
+        // 200 alone isn't enough — require the bot-manager's own shape so we
+        // don't false-pass on an edge/proxy error page.
+        const body = (await r.json().catch(() => null)) as
+          | { running_bots?: unknown }
+          | null;
+        if (body && Array.isArray(body.running_bots)) {
+          return { ready: true, waitedMs: Date.now() - startedAt, probes };
+        }
+        lastReason = "200 but unexpected body";
+      } else {
+        lastReason = `status ${r.status}`;
+      }
+    } catch (err) {
+      lastReason =
+        err instanceof Error
+          ? err.name === "AbortError"
+            ? `probe timeout after ${probeTimeoutMs}ms`
+            : err.message
+          : String(err);
+    } finally {
+      clearTimeout(timer);
+    }
+    // Don't oversleep past the cap.
+    if (Date.now() - startedAt + probeIntervalMs < capMs) {
+      await sleep(probeIntervalMs);
+    } else {
+      break;
+    }
+  }
+  throw new Error(
+    `Vexa not ready after ${Date.now() - startedAt}ms / ${probes} probes (last: ${lastReason})`,
+  );
+}
+
 /** Tell Vexa to leave a call. Idempotent on Vexa side; 404 is fine. */
 export async function vexaBotLeave(opts: {
   apiUrl: string;

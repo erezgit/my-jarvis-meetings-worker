@@ -16,6 +16,7 @@ import {
   createVexaBot,
   parseVexaMeetingUrl,
   vexaBotLeave,
+  waitForVexaReady,
 } from "../lib/vexa-bot";
 import { cancelMeetingDO, startVexaPollingForBot } from "../do-meeting";
 import { markMeetingEnded } from "../lib/meeting-persistence";
@@ -69,6 +70,27 @@ export async function handleMeetingBot(
   }
   if (!vexaKey || vexaKey.length === 0) {
     return json({ ok: false, error: "vexa_api_key not configured (cfg or env)" }, 500);
+  }
+
+  // WAKE-AND-WAIT GATE (root-cause fix for "meetings not working"). The
+  // per-tenant Vexa box auto-suspends when idle; a meeting started cold used to
+  // fail because we dispatched before its bot-manager had finished booting.
+  // This wakes the box and blocks until it can actually spawn a bot — capped
+  // hard at 120s. A warm box passes on the first probe (~instant), so this is
+  // free for back-to-back meetings and only costs the wake on the first one.
+  // Must run BEFORE the supersede block below, since that also calls Vexa.
+  try {
+    const gate = await waitForVexaReady({ apiUrl: vexaUrl, apiKey: vexaKey, capMs: 120_000 });
+    console.log(
+      `[meeting/bot] slug=${slug} vexa ready after ${gate.waitedMs}ms (${gate.probes} probe${gate.probes === 1 ? "" : "s"})`,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "vexa wake timeout";
+    console.error(`[meeting/bot] slug=${slug} vexa wake failed:`, msg);
+    // 503 = the box is still waking / unavailable; distinct from a 502 create
+    // failure. The dashboard persists this into meetings.notes so the reason is
+    // never lost again.
+    return json({ ok: false, error: `vexa not ready: ${msg}` }, 503);
   }
 
   let parsed;
