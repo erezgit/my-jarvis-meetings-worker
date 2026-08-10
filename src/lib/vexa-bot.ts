@@ -49,7 +49,11 @@ export async function createVexaBot(
 ): Promise<VexaBotCreateResult> {
   const language = opts.language && opts.language.length > 0 ? opts.language : "he";
   const task = opts.task ?? "transcribe";
-  const botName = opts.botName && opts.botName.length > 0 ? opts.botName : "TaylorMind Notetaker";
+  // ⚠️ ONE capital T, lower-case m: "Tailormind". Not TailorMind, not
+  // Taylormind. It is the client-facing brand and this string is the most
+  // client-facing thing we own — it is the name that appears in the roster of
+  // someone else's meeting, next to real people's names.
+  const botName = opts.botName && opts.botName.length > 0 ? opts.botName : "Tailormind Notetaker";
 
   const body: Record<string, unknown> = {
     platform: opts.platform,
@@ -59,7 +63,13 @@ export async function createVexaBot(
     bot_name: botName,
     recording_enabled: opts.recordingEnabled ?? true,
     transcribe_enabled: opts.transcribeEnabled ?? true,
-    // Join Google Meet SIGNED IN as the shared "TaylorMind Notetaker" Google account.
+    // Join Google Meet SIGNED IN as the shared "Tailormind Notetaker" Google account.
+    //
+    // ⚠️ AND THAT ACCOUNT'S OWN DISPLAY NAME IS THE ONE MEET SHOWS. For a
+    // signed-in participant Google renders the Google profile name, so fixing
+    // `bot_name` here is only half of it: the Google account has to be renamed
+    // too, or the roster keeps whatever it says. Two representations of one
+    // name, and the one nobody edits is the one everybody reads.
     // meeting-api reads this and injects the R2 creds + userdataS3Path into BOT_CONFIG
     // so the bot restores the signed-in browser profile from R2 (clears Google's
     // anonymous-bot block). Old images without the wiring ignore this field.
